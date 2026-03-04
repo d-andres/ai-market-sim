@@ -1,0 +1,16 @@
+# ── Core world / state modelling ──────────────────────────────────────────────
+pydantic>=2.0,<3.0
+
+# ── Async runtime ─────────────────────────────────────────────────────────────
+# asyncio is part of the stdlib; no extra install needed.
+
+# ── Web API + ASGI server ─────────────────────────────────────────────────────
+# FastAPI exposes simulation state over HTTP/WebSocket; uvicorn runs the server.
+fastapi>=0.110
+uvicorn[standard]>=0.29
+
+# ── Agentic framework (LLM decision-making) ───────────────────────────────────
+smolagents>=1.0
+
+# ── LLM provider (default: OpenAI-compatible) ─────────────────────────────────
+openai>=1.0

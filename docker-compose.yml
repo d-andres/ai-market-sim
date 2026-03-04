@@ -1,0 +1,17 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    # Mount the backend source so edits are reflected without a rebuild.
+    volumes:
+      - ./backend:/app
+    ports:
+      - "8000:8000"
+    # Pass secrets via a local .env file that is never committed.
+    # Copy .env.example → .env and fill in real values.
+    env_file:
+      - path: .env
+        required: false
+    stdin_open: true
+    tty: true
