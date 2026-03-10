@@ -22,9 +22,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # ── Application source ────────────────────────────────────────────────────────
 COPY . .
 
-EXPOSE 8000
+EXPOSE 7860
 
 # ── Default command ───────────────────────────────────────────────────────────
-# Starts the FastAPI app via uvicorn.
-# --reload watches /app for source changes (mirrors the volume mount in compose).
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+# Starts the FastAPI + NiceGUI app via uvicorn.
+# Hugging Face Spaces provides PORT at runtime; default to 7860 locally.
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-7860}"]

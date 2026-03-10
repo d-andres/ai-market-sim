@@ -6,10 +6,36 @@ on purpose: all domain logic lives in ``data/`` and (later) ``src/agents/``.
 """
 
 from fastapi import FastAPI
+from nicegui import ui
 
 from data import DEFAULT_MARKET, render_ascii
+from src.ui import register_pages
 
 app = FastAPI(title="ai-market-sim", version="0.1.0")
+
+
+def get_world_snapshot() -> dict:
+    """Return the current world state as a serializable snapshot."""
+    return {
+        "width": DEFAULT_MARKET.width,
+        "height": DEFAULT_MARKET.height,
+        "tiles": [
+            {
+                "x": tile.x,
+                "y": tile.y,
+                "tile_type": tile.tile_type,
+                "walkable": tile.walkable,
+                "interactable": tile.interactable,
+                "symbol": tile.symbol,
+            }
+            for tile in DEFAULT_MARKET.tiles
+        ],
+        "ascii": render_ascii(DEFAULT_MARKET),
+    }
+
+
+register_pages(get_world_snapshot)
+ui.run_with(app, storage_secret="ai-market-sim-dev-secret")
 
 
 @app.get("/health")
@@ -25,19 +51,4 @@ async def get_world() -> dict:
     The response includes the raw tile list (for programmatic use by the
     frontend renderer) and an ASCII snapshot for quick debugging.
     """
-    return {
-        "width":  DEFAULT_MARKET.width,
-        "height": DEFAULT_MARKET.height,
-        "tiles": [
-            {
-                "x":           tile.x,
-                "y":           tile.y,
-                "tile_type":   tile.tile_type,
-                "walkable":    tile.walkable,
-                "interactable": tile.interactable,
-                "symbol":      tile.symbol,
-            }
-            for tile in DEFAULT_MARKET.tiles
-        ],
-        "ascii": render_ascii(DEFAULT_MARKET),
-    }
+    return get_world_snapshot()
