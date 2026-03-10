@@ -1,6 +1,6 @@
 ---
 title: ai-market-sim
-emoji: "🛒"
+emoji: "⚔️"
 colorFrom: blue
 colorTo: green
 sdk: docker

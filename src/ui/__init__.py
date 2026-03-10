@@ -3,6 +3,7 @@
 from collections.abc import Callable
 import json
 
+from fastapi import Request
 from nicegui import ui
 
 from .log_feed import render_log_feed
@@ -13,14 +14,27 @@ def register_pages(get_world_snapshot: Callable[[], dict]) -> None:
 	"""Register NiceGUI pages for the application."""
 
 	@ui.page("/")
-	def dashboard() -> None:
+	def dashboard(request: Request) -> None:
 		ui.label("ai-market-sim").classes("text-3xl font-bold")
 		ui.label("Basic world dashboard for iterative development.").classes(
 			"text-sm text-gray-700"
 		)
-		with ui.row().classes("gap-4 text-sm"):
-			ui.link("Raw world JSON", "/world")
-			ui.link("Liveness", "/health")
+
+		scheme = request.headers.get("x-forwarded-proto", request.url.scheme)
+		host = request.headers.get(
+			"x-forwarded-host", request.headers.get("host", request.url.hostname or "")
+		)
+		base_url = f"{scheme}://{host}"
+		world_url = f"{base_url}/world"
+		health_url = f"{base_url}/health"
+
+		with ui.card().classes("w-full"):
+			ui.label("Direct API URLs").classes("text-base font-bold")
+			ui.label("Copy these if Spaces wrapper blocks link navigation.").classes(
+				"text-xs text-gray-700"
+			)
+			ui.input("/world", value=world_url).props("readonly").classes("w-full")
+			ui.input("/health", value=health_url).props("readonly").classes("w-full")
 
 		world_state = get_world_snapshot()
 		map_label = render_map_view(
