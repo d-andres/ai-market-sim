@@ -1,6 +1,7 @@
 """NiceGUI user interface components and page registration."""
 
 from collections.abc import Callable
+import json
 
 from nicegui import ui
 
@@ -17,6 +18,9 @@ def register_pages(get_world_snapshot: Callable[[], dict]) -> None:
 		ui.label("Basic world dashboard for iterative development.").classes(
 			"text-sm text-gray-700"
 		)
+		with ui.row().classes("gap-4 text-sm"):
+			ui.link("Raw world JSON", "/world")
+			ui.link("Liveness", "/health")
 
 		world_state = get_world_snapshot()
 		map_label = render_map_view(
@@ -34,6 +38,20 @@ def register_pages(get_world_snapshot: Callable[[], dict]) -> None:
 		def refresh_map() -> None:
 			snapshot = get_world_snapshot()
 			map_label.set_text(snapshot["ascii"])
+			json_label.set_text(json.dumps(snapshot, indent=2))
+			liveness_label.set_text('{"status": "ok"}')
+
+		with ui.card().classes("w-full mt-3"):
+			ui.label("State Inspector").classes("text-xl font-bold")
+			ui.label("Live JSON snapshot and liveness payload.").classes(
+				"text-sm text-gray-700"
+			)
+			json_label = ui.label(json.dumps(world_state, indent=2)).classes(
+				"font-mono text-xs whitespace-pre overflow-auto max-h-72"
+			)
+			liveness_label = ui.label('{"status": "ok"}').classes(
+				"font-mono text-xs text-green-700"
+			)
 
 		ui.button("Refresh Map", on_click=refresh_map).classes("mt-3")
 
