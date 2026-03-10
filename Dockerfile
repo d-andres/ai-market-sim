@@ -27,4 +27,4 @@ EXPOSE 8000
 # ── Default command ───────────────────────────────────────────────────────────
 # Starts the FastAPI app via uvicorn.
 # --reload watches /app for source changes (mirrors the volume mount in compose).
-CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]

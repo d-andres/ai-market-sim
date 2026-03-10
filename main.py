@@ -1,4 +1,4 @@
-"""src/main.py – FastAPI application entry point for ai-market-sim.
+"""main.py – FastAPI application entry point for ai-market-sim.
 
 This module wires the simulation state produced by the ``data`` package into
 HTTP and WebSocket endpoints that the frontend will consume.  It is kept thin
