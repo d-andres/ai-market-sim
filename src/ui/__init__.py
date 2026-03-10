@@ -44,7 +44,8 @@ def register_pages(get_world_snapshot: Callable[[], dict]) -> None:
 		)
 		render_log_feed(
 			[
-				"[system] Loaded map from current world state",
+				f"[system] Loaded map: {world_state['width']}x{world_state['height']}",
+				f"[system] {len(world_state.get('actors', []))} actors spawned",
 				"[hint] Use /world for JSON state and /health for liveness",
 			]
 		)
@@ -66,6 +67,35 @@ def register_pages(get_world_snapshot: Callable[[], dict]) -> None:
 			liveness_label = ui.label('{"status": "ok"}').classes(
 				"font-mono text-xs text-green-700"
 			)
+
+		# Physics debug panel.
+		with ui.card().classes("w-full mt-3"):
+			ui.label("Physics Debug").classes("text-xl font-bold")
+			ui.label("Actor positions, FOV, and pathfinding results.").classes(
+				"text-sm text-gray-700"
+			)
+			
+			for actor in world_state.get("actors", []):
+				with ui.expansion(f"{actor['name']} ({actor['role']})").classes("w-full"):
+					ui.label(f"Position: ({actor['x']}, {actor['y']})").classes("text-sm")
+					ui.label(f"Health: {actor['hp']}, Gold: {actor['gold']}").classes("text-sm")
+					
+					visible_actors = actor.get("visible_actors", [])
+					if visible_actors:
+						ui.label(f"Sees {len(visible_actors)} actor(s):").classes("text-sm font-bold text-blue-700")
+						for v_actor in visible_actors:
+							ui.label(f"  • {v_actor['name']} at ({v_actor['x']}, {v_actor['y']})").classes("text-sm")
+					else:
+						ui.label("No actors in sight.").classes("text-sm text-gray-600")
+					
+					visible_tiles_count = len(actor.get("visible_tiles", []))
+					ui.label(f"Visible tiles: {visible_tiles_count}").classes("text-sm")
+					
+					path = actor.get("path")
+					if path:
+						ui.label(f"Path to target ({len(path)} steps): {path[:5]}{'...' if len(path) > 5 else ''}").classes("text-sm text-green-700")
+					else:
+						ui.label("No path computed.").classes("text-sm text-gray-600")
 
 		ui.button("Refresh Map", on_click=refresh_map).classes("mt-3")
 

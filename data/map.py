@@ -108,17 +108,72 @@ def get_shop_locations(grid: Map) -> list[tuple[int, int]]:
 	return [(tile.x, tile.y) for tile in grid.tiles if tile.tile_type == TileType.SHOP]
 
 
-def render_ascii(grid: Map) -> str:
-	lines: list[str] = []
-	for y in range(grid.height):
-		line = ""
-		for x in range(grid.width):
-			line += grid.tile_at(x, y).symbol
-		lines.append(line)
-	return "\n".join(lines)
+def render_ascii(grid: Map, show_actors: bool = True) -> str:
+	"""Render map as ASCII string, optionally with actor positions.
+	
+	Args:
+	    grid: The Map to render.
+	    show_actors: If True, overlay actor symbols (G=Guard, P=Player, K=Shopkeeper, @=Other).
+	    
+	Returns:
+	    ASCII string representation of the map.
+	"""
+	# Build base map from tiles.
+	char_grid = [[grid.tile_at(x, y).symbol for x in range(grid.width)] for y in range(grid.height)]
+	
+	# Overlay actors if requested.
+	if show_actors:
+		from src.models.schema import ActorRole
+		
+		role_symbols = {
+			ActorRole.GUARD: "G",
+			ActorRole.SHOPKEEPER: "K",
+			ActorRole.PLAYER: "@",
+		}
+		
+		for actor in grid.actors:
+			if 0 <= actor.x < grid.width and 0 <= actor.y < grid.height:
+				symbol = role_symbols.get(actor.role, "?")
+				char_grid[actor.y][actor.x] = symbol
+	
+	return "\n".join("".join(row) for row in char_grid)
 
 
 DEFAULT_MAP: Map = load_or_build_default_map()
+
+# Add test actors for physics demonstration.
+from src.models.schema import Actor, ActorRole
+
+if not DEFAULT_MAP.actors:  # Only add if no actors exist.
+	DEFAULT_MAP.actors = [
+		Actor(
+			id="guard_1",
+			name="Guard Thorne",
+			role=ActorRole.GUARD,
+			x=5,
+			y=5,
+			gold=50,
+			hp=100,
+		),
+		Actor(
+			id="shopkeeper_1",
+			name="Merchant Elara",
+			role=ActorRole.SHOPKEEPER,
+			x=10,
+			y=3,
+			gold=200,
+			hp=80,
+		),
+		Actor(
+			id="player",
+			name="Adventurer",
+			role=ActorRole.PLAYER,
+			x=10,
+			y=10,
+			gold=0,
+			hp=100,
+		),
+	]
 
 # Backward-compatibility names used by current src/main.py.
 build_default_market = build_default_map
