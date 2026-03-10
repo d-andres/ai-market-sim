@@ -46,15 +46,45 @@ def register_pages(get_world_snapshot: Callable[[], dict]) -> None:
 			[
 				f"[system] Loaded map: {world_state['width']}x{world_state['height']}",
 				f"[system] {len(world_state.get('actors', []))} actors spawned",
+				"[system] Simulation heartbeat ready",
 				"[hint] Use /world for JSON state and /health for liveness",
 			]
 		)
+		
+		# Simulation status panel.
+		with ui.card().classes("w-full"):
+			ui.label("Simulation Heartbeat").classes("text-xl font-bold")
+			with ui.row().classes("w-full gap-4"):
+				tick_label = ui.label(f"Tick: {world_state['tick']} | Time: {world_state['elapsed_time_formatted']}").classes("text-lg font-mono")
+				status_label = ui.label("Ready").classes("text-sm")
+
+		# Recent events panel.
+		with ui.card().classes("w-full mt-3"):
+			ui.label("Recent Events").classes("text-xl font-bold")
+			ui.label("Last 10 events from the simulation.").classes("text-sm text-gray-700")
+			event_log_label = ui.label("\n".join(
+				[f"[{e['tick']:03d}] {e['actor_id']}: {e['description']}" 
+				 for e in world_state.get("recent_events", [])]
+			) or "[system] No events yet").classes("font-mono text-sm whitespace-pre overflow-auto max-h-64")
 
 		def refresh_map() -> None:
 			snapshot = get_world_snapshot()
 			map_label.set_text(snapshot["ascii"])
 			json_label.set_text(json.dumps(snapshot, indent=2))
 			liveness_label.set_text('{"status": "ok"}')
+			
+			# Update tick counter and time display.
+			tick_label.set_text(f"Tick: {snapshot['tick']} | Time: {snapshot['elapsed_time_formatted']}")
+			status_label.set_text("✓ Tick advanced").classes("text-green-700 font-bold")
+			
+			# Update event log.
+			event_lines = []
+			for event in snapshot.get("recent_events", []):
+				event_lines.append(
+					f"[{event['tick']:03d}] {event['actor_id']}: {event['description']}"
+				)
+			if event_lines:
+				event_log_label.set_text("\n".join(event_lines))
 
 		with ui.card().classes("w-full mt-3"):
 			ui.label("State Inspector").classes("text-xl font-bold")

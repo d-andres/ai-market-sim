@@ -11,15 +11,31 @@ from nicegui import ui
 from data import DEFAULT_MARKET, render_ascii
 from src.ui import register_pages
 from src.simulation.physics import get_visible_tiles_and_actors, breadth_first_search
+from src.simulation.engine import initialize_engine, get_engine
 
 app = FastAPI(title="ai-market-sim", version="0.1.0")
+
+# Initialize the simulation engine with AI enabled.
+# Set enable_ai=False to disable AI agents for testing.
+# See AI-AGENT-INTEGRATION.md for LLM provider setup instructions.
+engine = initialize_engine(
+    DEFAULT_MARKET,
+    tick_rate=2.0,
+    enable_ai=True,  # Toggle AI on/off
+    ollama_model="ollama/llama3.2",  # LLM model (format depends on provider)
+    ollama_base_url="http://localhost:11434",  # API base URL (for Ollama)
+)
 
 
 def get_world_snapshot() -> dict:
     """Return the current world state as a serializable snapshot.
     
     Includes physics data: actor FOV, pathfinding results.
+    Advances the simulation by one tick each call.
     """
+    # Tick the engine (advance simulation by one step).
+    engine.tick()
+    
     # Compute physics data for each actor.
     actor_data = []
     for actor in DEFAULT_MARKET.actors:
@@ -54,6 +70,9 @@ def get_world_snapshot() -> dict:
         })
     
     return {
+        "tick": engine.tick_count,
+        "elapsed_time": engine.get_elapsed_time(),
+        "elapsed_time_formatted": engine.get_elapsed_time_formatted(),
         "width": DEFAULT_MARKET.width,
         "height": DEFAULT_MARKET.height,
         "tiles": [
@@ -69,6 +88,7 @@ def get_world_snapshot() -> dict:
         ],
         "ascii": render_ascii(DEFAULT_MARKET, show_actors=True),
         "actors": actor_data,
+        "recent_events": engine.get_event_log(limit=10),
     }
 
 

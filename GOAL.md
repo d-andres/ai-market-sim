@@ -50,8 +50,8 @@ Follow this order to build your project from the ground up. Each step provides t
 ### ⚙️ Phase 2: The Living World (Mechanics)
 *Goal: Make the world move and update without AI yet.*
 
-4.  **`src/simulation/engine.py`** * **Task:** Create the "Heartbeat" loop. Implement simple non-AI movement (e.g., a Guard moving back and forth).  
-    * **Why:** To ensure your state updates correctly every second/tick.
+4.  **`src/simulation/engine.py`** * **Task:** Create the "Heartbeat" loop.  
+    * **Why:** To ensure your state updates correctly every 2 seconds/tick.
 
 5.  **`src/ui/map_view.py` & `src/ui/log_feed.py`** * **Task:** Integrate NiceGUI components to visualize the grid using ASCII characters and display live action logs.  
     * **Why:** You need a way to visually verify that Phase 1 and 2 are working correctly in real-time.

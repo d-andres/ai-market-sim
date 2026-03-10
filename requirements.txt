@@ -18,3 +18,6 @@ smolagents>=1.0
 
 # ── LLM provider (default: OpenAI-compatible) ─────────────────────────────────
 openai>=1.0
+
+# ── Local LLM support (Ollama) ────────────────────────────────────────────────
+ollama>=0.1.0
