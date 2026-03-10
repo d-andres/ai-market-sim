@@ -5,6 +5,8 @@ HTTP and WebSocket endpoints that the frontend will consume.  It is kept thin
 on purpose: all domain logic lives in ``data/`` and (later) ``src/agents/``.
 """
 
+import os
+
 from fastapi import FastAPI
 from nicegui import ui
 
@@ -15,15 +17,22 @@ from src.simulation.engine import initialize_engine, get_engine
 
 app = FastAPI(title="ai-market-sim", version="0.1.0")
 
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
 # Initialize the simulation engine with AI enabled.
 # Set enable_ai=False to disable AI agents for testing.
 # See AI-AGENT-INTEGRATION.md for LLM provider setup instructions.
 engine = initialize_engine(
     DEFAULT_MARKET,
-    tick_rate=2.0,
-    enable_ai=True,  # Toggle AI on/off
-    ollama_model="ollama/llama3.2",  # LLM model (format depends on provider)
-    ollama_base_url="http://localhost:11434",  # API base URL (for Ollama)
+    tick_rate=float(os.getenv("TICK_RATE", "2.0")),
+    enable_ai=_env_bool("ENABLE_AI", True),
+    ollama_model=os.getenv("LLM_MODEL", "ollama/llama3.2"),
+    ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
 )
 
 
