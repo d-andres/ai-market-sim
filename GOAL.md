@@ -70,10 +70,31 @@ Follow this order to build your project from the ground up. Each step provides t
 ---
 
 ### 🌐 Phase 4: Opening the Gates (Connectivity)
-*Goal: Allow the outside world to see and join the simulation.*
+*Goal: Allow the outside world to observe the simulation and submit their own player agent into it — without needing any technical knowledge.*
 
-8.  **`main.py`** * **Task:** Integrate **NiceGUI** with FastAPI to create a web interface. Set up endpoints (e.g., `GET /map`, `POST /player/action`).  
-    * **Why:** This provides real-time visual feedback and allows users to interact with the simulation through a browser.
+8.  **`/join` page (`src/ui/__init__.py`)** — A clean, mobile-friendly NiceGUI page that any user can open on a phone or browser.
+    * Displays a plain-English explanation of the world: one shared marketplace, one legendary relic (The Lost Crown), autonomous NPC agents already running.
+    * Two inputs only: **Agent Name** and **Personality & Approach** (a single free-text field — e.g. *"Generous and diplomatic, always offers fair trades, avoids upsetting the guard"*).
+    * On submit, the agent is spawned into the live shared simulation and the user is redirected to their personal status page.
+    * **Why:** Removes all technical barriers. Users express agent behavior in plain language — the LLM handles the rest.
 
-9.  **`Dockerfile` & `requirements.txt`** * **Task:** Package the application into a container.  
+9.  **`/player/{id}` page (`src/ui/__init__.py`)** — A read-only, auto-refreshing status page for each spawned player agent.
+    * Shows agent name, current gold, inventory, position, and a live feed of recent decisions in plain English.
+    * Displays a clear win/active/eliminated status badge.
+    * A shareable link is provided on the join confirmation so users can bookmark or paste it into chat.
+    * **Why:** Users watch their agent reason and act autonomously — this *is* the educational demonstration of agentic AI.
+
+10. **Player spawning & win detection (`src/simulation/engine.py`)** — Engine gains `spawn_player_actor()` to dynamically add a new actor and brain at runtime.
+    * An active player cap (default: **5 concurrent players**) is enforced to prevent LLM and simulation overload. Attempts beyond the cap return a friendly "Simulation is full" message.
+    * Each tick the engine checks if any player actor holds `lost_crown` in their inventory and logs a terminal `win` event.
+    * **Why:** Keeps the simulation stable and LLM inference manageable during a live presentation.
+
+11. **`POST /player/join` endpoint (`main.py`)** — Internal API endpoint consumed by the `/join` form.
+    * Accepts `name` and `personality` strings. Validates the player cap. Returns the new player `id` and status URL.
+    * **Why:** Separates form submission logic from the UI layer cleanly.
+
+12. **`build_player_prompt(name, personality)` (`src/agents/prompts.py`)** — Constructs the player agent's system prompt by combining the fixed world context (the crown goal, trade mechanics, NPC roles) with the user's free-text personality string.
+    * **Why:** The user's input shapes the agent's decision-making without exposing any underlying prompt engineering to the user.
+
+13. **`Dockerfile` & `requirements.txt`** * **Task:** Package the application into a container.
     * **Why:** To fulfill your goal of an "educational experience" that anyone can run with one command.
