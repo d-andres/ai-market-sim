@@ -36,8 +36,11 @@ Once the build succeeds, your app will be served from the Space URL.
 ### With Docker
 
 ```bash
-docker build -t ai-market-sim .
-docker run --rm -p 7860:7860 ai-market-sim
+docker build -t ai-market-sim:local .
+docker run --rm -p 7860:7860 \
+	--env-file .env.docker \
+	--add-host=host.docker.internal:host-gateway \
+	ai-market-sim:local
 ```
 
 Open `http://localhost:7860`.
