@@ -9,3 +9,6 @@ __pycache__/
 
 # Docker
 .dockerignore
+
+# Notes
+NOTES.md
