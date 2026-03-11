@@ -18,6 +18,30 @@ from src.simulation.engine import initialize_engine, get_engine
 app = FastAPI(title="ai-market-sim", version="0.1.0")
 
 
+def _load_local_env_file(env_file: str = ".env") -> None:
+    """Load simple KEY=VALUE pairs from a local .env file.
+
+    Existing environment variables are not overwritten.
+    """
+    if not os.path.exists(env_file):
+        return
+
+    with open(env_file, "r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+
+_load_local_env_file()
+
+
 def _env_bool(name: str, default: bool) -> bool:
     value = os.getenv(name)
     if value is None:
