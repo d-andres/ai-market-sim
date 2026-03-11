@@ -13,7 +13,7 @@ from nicegui import ui
 from data import DEFAULT_MARKET, render_ascii
 from src.ui import register_pages
 from src.simulation.physics import get_visible_tiles_and_actors, breadth_first_search
-from src.simulation.engine import initialize_engine, get_engine
+from src.simulation.engine import initialize_engine
 
 app = FastAPI(title="ai-market-sim", version="0.1.0")
 

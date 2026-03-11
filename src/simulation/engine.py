@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from src.models.schema import Actor, Map
+from src.models.schema import Actor, Map, TradeProposal
 
 if TYPE_CHECKING:
 	from src.agents.brain import AgentBrain
@@ -211,6 +211,127 @@ class SimulationEngine:
 			}
 			for e in self.events[-limit:]
 		]
+
+	def evaluate_trade_proposal(
+		self,
+		proposal: TradeProposal,
+		proposer: Actor,
+		target: Actor,
+	) -> str:
+		"""Route a trade proposal to the target's brain for LLM evaluation,
+		then execute the transfer if accepted and record memory on both sides.
+
+		Returns a human-readable outcome string sent back to the proposer's tool.
+		"""
+		target_brain = self.agent_brains.get(target.id)
+
+		if target_brain is None:
+			# No AI brain — target always declines
+			return f"{target.name} ignores your offer."
+
+		accepted, spoken = target_brain.evaluate_trade_proposal(
+			proposal=proposal, proposer=proposer
+		)
+
+		if accepted:
+			result = self._resolve_trade(proposal, proposer, target)
+			if result is not None:
+				# Something became invalid between evaluation and execution
+				accepted = False
+				spoken = result
+
+		event_type = "trade_accepted" if accepted else "trade_declined"
+		description = (
+			f"{target.name} {'accepted' if accepted else 'declined'} a trade with "
+			f"{proposer.name}. {target.name} said: \"{spoken}\""
+		)
+		self._log_event(
+			actor_id=target.id,
+			event_type=event_type,
+			description=description,
+			data={
+				"proposer_id": proposer.id,
+				"accepted": accepted,
+				"offered_gold": proposal.offered_gold,
+				"offered_items": [i.id for i in proposal.offered_items],
+				"requested_gold": proposal.requested_gold,
+				"requested_items": [i.id for i in proposal.requested_items],
+			},
+		)
+
+		# Write interaction memories on both brains so future turns recall this
+		notes = (
+			f"{'Accepted' if accepted else 'Declined'} trade — "
+			f"offered {proposal.offered_gold}g + [{', '.join(i.name for i in proposal.offered_items)}], "
+			f"requested {proposal.requested_gold}g + [{', '.join(i.name for i in proposal.requested_items)}]. "
+			f"Said: \"{spoken}\""
+		)
+		target_brain.memory.record(
+			tick=self.tick_count,
+			actor_id=proposer.id,
+			event_type=event_type,
+			notes=notes,
+		)
+		proposer_brain = self.agent_brains.get(proposer.id)
+		if proposer_brain:
+			proposer_brain.memory.record(
+				tick=self.tick_count,
+				actor_id=target.id,
+				event_type=event_type,
+				notes=(
+					f"{target.name} {'accepted' if accepted else 'declined'} our trade. "
+					f"They said: \"{spoken}\""
+				),
+			)
+
+		if accepted:
+			return f"{target.name} accepted the trade. They said: \"{spoken}\""
+		return f"{target.name} declined the trade. They said: \"{spoken}\""
+
+	def _resolve_trade(
+		self,
+		proposal: TradeProposal,
+		proposer: Actor,
+		target: Actor,
+	) -> str | None:
+		"""Execute the actual item/gold transfer for an accepted proposal.
+
+		Returns None on success, or an error string if the trade is no longer
+		valid (e.g. gold or items changed between evaluation and execution).
+		"""
+		# Re-validate gold
+		if proposal.offered_gold > proposer.gold:
+			return f"{proposer.name} no longer has enough gold."
+		if proposal.requested_gold > target.gold:
+			return f"{target.name} no longer has enough gold."
+
+		# Re-validate items still in inventory
+		proposer_inv = {item.id: item for item in proposer.inventory}
+		target_inv = {item.id: item for item in target.inventory}
+		for item in proposal.offered_items:
+			if item.id not in proposer_inv:
+				return f"{proposer.name} no longer has {item.name}."
+		for item in proposal.requested_items:
+			if item.id not in target_inv:
+				return f"{target.name} no longer has {item.name}."
+
+		# Transfer gold
+		proposer.gold -= proposal.offered_gold
+		proposer.gold += proposal.requested_gold
+		target.gold += proposal.offered_gold
+		target.gold -= proposal.requested_gold
+
+		# Transfer items: offered items go from proposer → target
+		for item in proposal.offered_items:
+			proposer.inventory = [i for i in proposer.inventory if i.id != item.id]
+			target.inventory.append(item)
+
+		# Requested items go from target → proposer
+		for item in proposal.requested_items:
+			target.inventory = [i for i in target.inventory if i.id != item.id]
+			proposer.inventory.append(item)
+
+		return None
 
 
 # Global simulation instance (will be initialized in main.py).

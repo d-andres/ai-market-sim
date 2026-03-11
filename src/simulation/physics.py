@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from src.models.schema import Actor, Map, Tile
+from src.models.schema import Actor, Map
 
 
 # ── Direction vectors for 8-directional movement ──────────────────────────────
@@ -324,7 +324,9 @@ def breadth_first_search(
 	Returns:
 	    List of (x, y) coordinates from start to goal (inclusive), or None if no path.
 	"""
-	if not can_move_to(world_map, goal_x, goal_y, exclude_actor_id):
+	# Only reject if the goal is out-of-bounds or a wall — allow occupied tiles
+	# so we can compute a path *toward* another actor without stepping on them.
+	if not world_map.in_bounds(goal_x, goal_y) or not world_map.tile_at(goal_x, goal_y).walkable:
 		return None
 	
 	from collections import deque

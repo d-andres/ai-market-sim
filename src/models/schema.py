@@ -113,6 +113,17 @@ class Map(BaseModel):
 		return self.in_bounds(x, y) and self.tile_at(x, y).walkable
 
 
+class TradeProposal(BaseModel):
+	"""A proposed exchange of items and/or gold between two actors."""
+
+	proposer_id: str
+	target_id: str
+	offered_items: list[Item] = Field(default_factory=list)
+	offered_gold: int = Field(default=0, ge=0)
+	requested_items: list[Item] = Field(default_factory=list)
+	requested_gold: int = Field(default=0, ge=0)
+
+
 __all__ = [
 	"TileType",
 	"ActorRole",
@@ -120,4 +131,5 @@ __all__ = [
 	"Tile",
 	"Actor",
 	"Map",
+	"TradeProposal",
 ]

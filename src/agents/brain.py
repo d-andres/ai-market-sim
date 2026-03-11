@@ -1,9 +1,10 @@
 """Agent brain: LLM-driven decision making using Smolagents.
 
 This module connects actors to their AI "brains" which can:
-- Observe the world around them
-- Reason about their situation
-- Take actions via registered tools
+- Observe the world around them (including visible inventories)
+- Remember past interactions and relationships
+- Propose and evaluate trades using LLM judgment
+- Move and act in the world
 
 Supports multiple LLM providers via LiteLLM (Ollama, OpenAI, Anthropic, etc.).
 See AI-AGENT-INTEGRATION.md for setup instructions.
@@ -11,26 +12,73 @@ See AI-AGENT-INTEGRATION.md for setup instructions.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from smolagents import Tool, LiteLLMModel, CodeAgent
 
-from src.models.schema import Actor, ActorRole, Map
+from src.models.schema import Actor, Item, Map, TradeProposal
 from src.simulation import physics
-from src.agents.prompts import get_system_prompt_for_role
+from src.agents.prompts import TRADE_EVALUATION_PROMPT, get_system_prompt_for_role
 
 if TYPE_CHECKING:
 	from src.simulation.engine import SimulationEngine
 
 
+# ---------------------------------------------------------------------------
+# Relationship memory
+# ---------------------------------------------------------------------------
+
+@dataclass
+class InteractionRecord:
+	"""One remembered interaction between two actors."""
+	tick: int
+	actor_id: str
+	event_type: str   # "trade_accepted", "trade_declined", "spoke", "observed", ...
+	notes: str        # Free-text written by the LLM or system
+
+
+class RelationshipMemory:
+	"""Stores an actor's remembered interactions with every other actor.
+
+	Designately open-ended: the LLM appends free-text notes so it can
+	remember anything — not just structured outcomes.
+	"""
+
+	def __init__(self) -> None:
+		# actor_id -> list of interaction records
+		self._records: dict[str, list[InteractionRecord]] = {}
+
+	def record(self, tick: int, actor_id: str, event_type: str, notes: str) -> None:
+		self._records.setdefault(actor_id, []).append(
+			InteractionRecord(tick=tick, actor_id=actor_id, event_type=event_type, notes=notes)
+		)
+
+	def history_for(self, actor_id: str, limit: int = 10) -> list[InteractionRecord]:
+		return self._records.get(actor_id, [])[-limit:]
+
+	def summary_for(self, actor_id: str, actor_name: str) -> str:
+		"""Return a human-readable history string ready for prompt injection."""
+		records = self.history_for(actor_id)
+		if not records:
+			return f"No prior history with {actor_name}."
+		lines = [f"[tick {r.tick}] {r.event_type}: {r.notes}" for r in records]
+		return "\n".join(lines)
+
+
+
+# ---------------------------------------------------------------------------
+# Tools
+# ---------------------------------------------------------------------------
+
 class ObserveSurroundingsTool(Tool):
-	"""Tool for an actor to observe their surroundings."""
+	"""Tool for an actor to observe their surroundings, including nearby inventories."""
 	
 	name = "observe_surroundings"
 	description = (
-		"Observe your surroundings and see what's around you. "
-		"Returns information about visible tiles, nearby actors, and points of interest. "
-		"Use this to understand your environment before taking action."
+		"Observe your surroundings. Returns your position, visible actors and their "
+		"inventories, nearby shops, and a summary of your own gold and inventory. "
+		"Use this before deciding whether to propose a trade."
 	)
 	inputs = {
 		"vision_range": {
@@ -41,48 +89,193 @@ class ObserveSurroundingsTool(Tool):
 	}
 	output_type = "string"
 	
-	def __init__(self, actor: Actor, world_map: Map, **kwargs):
+	def __init__(self, actor: Actor, world_map: Map, memory: RelationshipMemory, **kwargs):
 		super().__init__(**kwargs)
 		self.actor = actor
 		self.world_map = world_map
+		self.memory = memory
 	
 	def forward(self, vision_range: int = 10) -> str:
-		"""Execute the observation."""
-		# Get field of vision
 		viewport = physics.get_visible_tiles_and_actors(
-			self.world_map, 
-			self.actor, 
-			vision_range=vision_range
+			self.world_map, self.actor, vision_range=vision_range
 		)
-		
-		# Build observation report
-		report = f"You are at position ({self.actor.x}, {self.actor.y}).\n\n"
-		
-		# Visible actors
-		if viewport.visible_actors:
-			report += "Visible actors:\n"
-			for other_actor in viewport.visible_actors:
-				distance = physics.distance_chebyshev(
-					self.actor.x, self.actor.y,
-					other_actor.x, other_actor.y
-				)
-				report += f"- {other_actor.name} ({other_actor.role.value}) at ({other_actor.x}, {other_actor.y}), distance: {distance} tiles\n"
+
+		lines: list[str] = []
+		lines.append(f"You are at ({self.actor.x}, {self.actor.y}).")
+		lines.append(f"Your gold: {self.actor.gold}g")
+
+		if self.actor.inventory:
+			inv = ", ".join(f"{i.name} x{i.quantity}" for i in self.actor.inventory)
+			lines.append(f"Your inventory: {inv}")
 		else:
-			report += "No other actors are visible.\n"
-		
-		report += f"\nYou can see {len(viewport.visible_tiles)} tiles around you.\n"
-		
-		# Check for shops nearby
-		shops_nearby = []
-		for x, y in viewport.visible_tiles:
-			tile = self.world_map.tile_at(x, y)
-			if tile and tile.interactable:
-				shops_nearby.append((x, y))
-		
-		if shops_nearby:
-			report += f"\nShops visible: {len(shops_nearby)} shop(s) within sight.\n"
-		
-		return report
+			lines.append("Your inventory: (empty)")
+
+		if viewport.visible_actors:
+			lines.append("\nVisible actors:")
+			for other in viewport.visible_actors:
+				dist = physics.distance_chebyshev(
+					self.actor.x, self.actor.y, other.x, other.y
+				)
+				inv_str = (
+					", ".join(f"{i.name} (base {i.base_price}g) x{i.quantity}" for i in other.inventory)
+					if other.inventory else "nothing visible"
+				)
+				lines.append(
+					f"  - {other.name} [{other.role.value}] at ({other.x},{other.y}), "
+					f"dist {dist}, gold {other.gold}g | carrying: {inv_str}"
+				)
+				# Surface relationship history so the LLM can use it
+				history = self.memory.summary_for(other.id, other.name)
+				lines.append(f"    History: {history}")
+		else:
+			lines.append("\nNo other actors visible.")
+
+		shop_coords = [
+			(x, y) for x, y in viewport.visible_tiles
+			if self.world_map.tile_at(x, y).interactable
+		]
+		if shop_coords:
+			lines.append(f"\nShop tiles in view: {len(shop_coords)}")
+
+		return "\n".join(lines)
+
+
+class ProposeTradeTool(Tool):
+	"""Tool to propose a trade to a nearby actor.
+
+	The *proposer* specifies what they offer and what they want.
+	The target actor's LLM brain then evaluates the deal autonomously
+	based on their personality, item values, and relationship history.
+	"""
+
+	name = "propose_trade"
+	description = (
+		"Propose a trade to another actor who is nearby. "
+		"Specify the target actor's id, what you are offering (item ids and/or gold), "
+		"and what you are requesting from them (item ids and/or gold). "
+		"The other actor will decide whether to accept or decline based on their own judgment. "
+		"Returns the outcome and what they said."
+	)
+	inputs = {
+		"target_actor_id": {
+			"type": "string",
+			"description": "The id of the actor you want to trade with.",
+		},
+		"offered_item_ids": {
+			"type": "string",
+			"description": (
+				"Comma-separated item ids from YOUR inventory that you are offering. "
+				"Leave empty or pass empty string if offering only gold."
+			),
+		},
+		"offered_gold": {
+			"type": "integer",
+			"description": "Amount of gold you are offering. Use 0 if offering no gold.",
+		},
+		"requested_item_ids": {
+			"type": "string",
+			"description": (
+				"Comma-separated item ids from the TARGET'S inventory that you want. "
+				"Leave empty or pass empty string if requesting only gold."
+			),
+		},
+		"requested_gold": {
+			"type": "integer",
+			"description": "Amount of gold you are requesting. Use 0 if requesting no gold.",
+		},
+	}
+	output_type = "string"
+
+	def __init__(
+		self,
+		actor: Actor,
+		world_map: Map,
+		engine: SimulationEngine,
+		memory: RelationshipMemory,
+		**kwargs,
+	):
+		super().__init__(**kwargs)
+		self.actor = actor
+		self.world_map = world_map
+		self.engine = engine
+		self.memory = memory
+
+	def _resolve_items(
+		self, id_string: str, owner: Actor
+	) -> tuple[list[Item], str | None]:
+		"""Parse a comma-separated item id string against an actor's inventory.
+
+		Returns (matched_items, error_message).  error_message is None on success.
+		"""
+		if not id_string or not id_string.strip():
+			return [], None
+		wanted = [s.strip() for s in id_string.split(",") if s.strip()]
+		inv_by_id = {item.id: item for item in owner.inventory}
+		matched: list[Item] = []
+		for iid in wanted:
+			if iid not in inv_by_id:
+				return [], f"{owner.name} does not have item '{iid}' in their inventory."
+			matched.append(inv_by_id[iid])
+		return matched, None
+
+	def forward(
+		self,
+		target_actor_id: str,
+		offered_item_ids: str = "",
+		offered_gold: int = 0,
+		requested_item_ids: str = "",
+		requested_gold: int = 0,
+	) -> str:
+		# --- Validate target exists and is nearby ---
+		target = next(
+			(a for a in self.world_map.actors if a.id == target_actor_id), None
+		)
+		if target is None:
+			return f"No actor with id '{target_actor_id}' found."
+
+		dist = physics.distance_chebyshev(
+			self.actor.x, self.actor.y, target.x, target.y
+		)
+		if dist > 2:
+			return (
+				f"{target.name} is too far away ({dist} tiles). "
+				"Move closer before proposing a trade."
+			)
+
+		# --- Validate gold ---
+		if offered_gold > self.actor.gold:
+			return (
+				f"You only have {self.actor.gold}g but are trying to offer {offered_gold}g."
+			)
+		if requested_gold > target.gold:
+			return (
+				f"{target.name} only has {target.gold}g but you are requesting {requested_gold}g."
+			)
+
+		# --- Validate items exist in correct inventories ---
+		offered_items, err = self._resolve_items(offered_item_ids, self.actor)
+		if err:
+			return err
+		requested_items, err = self._resolve_items(requested_item_ids, target)
+		if err:
+			return err
+
+		proposal = TradeProposal(
+			proposer_id=self.actor.id,
+			target_id=target.id,
+			offered_items=offered_items,
+			offered_gold=offered_gold,
+			requested_items=requested_items,
+			requested_gold=requested_gold,
+		)
+
+		# --- Route to the target's brain for LLM evaluation ---
+		outcome = self.engine.evaluate_trade_proposal(
+			proposal=proposal,
+			proposer=self.actor,
+			target=target,
+		)
+		return outcome
 
 
 class MoveTool(Tool):
@@ -170,13 +363,20 @@ class WaitTool(Tool):
 		return "You wait and observe your surroundings."
 
 
+# ---------------------------------------------------------------------------
+# Agent brain
+# ---------------------------------------------------------------------------
+
 class AgentBrain:
-	"""AI brain for an autonomous actor using LLM via LiteLLM.
-	
-	Supports multiple LLM providers: Ollama (local), OpenAI, Anthropic, etc.
-	See AI-AGENT-INTEGRATION.md for provider setup instructions.
+	"""AI brain for an autonomous actor.
+
+	Holds:
+	- A Smolagents CodeAgent backed by any LiteLLM-compatible model
+	- A RelationshipMemory so the LLM can recall past interactions
+	- evaluate_trade_proposal(): called by the engine when *this* actor
+	  is the target of a trade so the LLM decides accept/decline
 	"""
-	
+
 	def __init__(
 		self,
 		actor: Actor,
@@ -185,69 +385,113 @@ class AgentBrain:
 		model_name: str = "ollama/llama3.2",
 		api_base: str = "http://localhost:11434",
 	):
-		"""Initialize an agent brain.
-		
-		Args:
-		    actor: The Actor this brain controls.
-		    world_map: The world Map.
-		    engine: The SimulationEngine instance.
-		    model_name: LLM model identifier (e.g., 'ollama/llama3.2', 'gpt-4o-mini').
-		    api_base: API base URL (required for Ollama, optional for cloud providers).
-		"""
 		self.actor = actor
 		self.world_map = world_map
 		self.engine = engine
-		
-		# Initialize LiteLLM model (auto-detects provider from model_name)
-		self.model = LiteLLMModel(
-			model_id=model_name,
-			api_base=api_base,
-		)
-		
-		# Get role-specific system prompt
+		self.memory = RelationshipMemory()
+
+		self.model = LiteLLMModel(model_id=model_name, api_base=api_base)
 		system_prompt = get_system_prompt_for_role(actor.role)
-		
-		# Initialize tools
+
 		self.tools = [
-			ObserveSurroundingsTool(actor=actor, world_map=world_map),
+			ObserveSurroundingsTool(actor=actor, world_map=world_map, memory=self.memory),
 			MoveTool(actor=actor, world_map=world_map, engine=engine),
 			WaitTool(actor=actor, engine=engine),
+			ProposeTradeTool(actor=actor, world_map=world_map, engine=engine, memory=self.memory),
 		]
-		
-		# Create the agent
+
 		self.agent = CodeAgent(
 			tools=self.tools,
 			model=self.model,
 			system_prompt=system_prompt,
-			max_steps=3,  # Limit reasoning steps per turn
+			max_steps=3,
 		)
-	
+
 	def take_turn(self) -> str:
-		"""Let the agent take one turn (observe, reason, act).
-		
-		Returns:
-		    A summary of what the agent did.
-		"""
+		"""Let the agent take one turn (observe, reason, act)."""
 		try:
-			# Prompt the agent to take action
+			inv_summary = (
+				", ".join(f"{i.name} x{i.quantity}" for i in self.actor.inventory)
+				or "nothing"
+			)
 			prompt = (
 				f"You are {self.actor.name}, a {self.actor.role.value}. "
-				f"It's your turn to act. First observe your surroundings, then decide what to do. "
-				f"You have {self.actor.hp} HP and {self.actor.gold} gold."
+				f"Tick {self.engine.tick_count}. "
+				f"HP: {self.actor.hp} | Gold: {self.actor.gold}g | Carrying: {inv_summary}. "
+				"Observe your surroundings, then decide what to do. "
+				"If a good trade opportunity is nearby, use propose_trade."
 			)
-			
 			result = self.agent.run(prompt)
 			return f"{self.actor.name}: {result}"
-			
 		except Exception as e:
-			# If agent fails, default to waiting
 			self.engine._log_event(
 				actor_id=self.actor.id,
 				event_type="error",
-				description=f"{self.actor.name} encountered an error: {str(e)}",
-				data={"error": str(e)}
+				description=f"{self.actor.name} encountered an error: {e}",
+				data={"error": str(e)},
 			)
-			return f"{self.actor.name} failed to act: {str(e)}"
+			return f"{self.actor.name} failed to act: {e}"
+
+	def evaluate_trade_proposal(
+		self,
+		proposal: TradeProposal,
+		proposer: Actor,
+	) -> tuple[bool, str]:
+		"""Ask this actor's LLM to evaluate an incoming trade proposal.
+
+		The LLM receives a fully-rendered prompt containing:
+		- The proposer's identity and role
+		- Relationship history with the proposer
+		- A plain-English summary of what is offered vs. requested
+
+		It must respond with two lines:
+		  DECISION: ACCEPT / DECLINE
+		  RESPONSE: <in-character spoken reply>
+
+		Returns (accepted: bool, spoken_response: str).
+		"""
+		# Build human-readable offer summaries
+		offered_parts: list[str] = []
+		if proposal.offered_gold:
+			offered_parts.append(f"{proposal.offered_gold} gold")
+		for item in proposal.offered_items:
+			offered_parts.append(f"{item.name} x{item.quantity} (base value {item.base_price}g each)")
+		offered_summary = ", ".join(offered_parts) if offered_parts else "nothing"
+
+		requested_parts: list[str] = []
+		if proposal.requested_gold:
+			requested_parts.append(f"{proposal.requested_gold} gold")
+		for item in proposal.requested_items:
+			requested_parts.append(f"{item.name} x{item.quantity} (base value {item.base_price}g each)")
+		requested_summary = ", ".join(requested_parts) if requested_parts else "nothing"
+
+		relationship = self.memory.summary_for(proposer.id, proposer.name)
+
+		prompt = TRADE_EVALUATION_PROMPT.format(
+			actor_gold=self.actor.gold,
+			proposer_name=proposer.name,
+			proposer_role=proposer.role.value,
+			relationship_history=relationship,
+			offered_summary=offered_summary,
+			requested_summary=requested_summary,
+		)
+
+		try:
+			raw: str = self.model(prompt)  # Direct model call, no tool loop needed
+		except Exception as e:
+			return False, f"{self.actor.name} couldn't process the offer right now."
+
+		# Parse two-line response
+		lines = [l.strip() for l in raw.strip().splitlines() if l.strip()]
+		accepted = False
+		spoken = f"{self.actor.name} considers the offer silently."
+		for line in lines:
+			if line.upper().startswith("DECISION:"):
+				accepted = "ACCEPT" in line.upper()
+			elif line.upper().startswith("RESPONSE:"):
+				spoken = line.split(":", 1)[1].strip()
+
+		return accepted, spoken
 
 
 def create_agent_for_actor(
