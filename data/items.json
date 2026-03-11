@@ -1,0 +1,180 @@
+{
+  "items": [
+    {
+      "id": "dagger",
+      "name": "Dagger",
+      "description": "A short, double-edged blade favored by scouts and thieves. Light enough to conceal, sharp enough to matter.",
+      "base_price": 8,
+      "quantity": 1,
+      "metadata": { "category": "weapon", "type": "blade", "slot": "hand" }
+    },
+    {
+      "id": "short_sword",
+      "name": "Short Sword",
+      "description": "A reliable one-handed sword with a straight blade. A common sidearm for soldiers and adventurers alike.",
+      "base_price": 25,
+      "quantity": 1,
+      "metadata": { "category": "weapon", "type": "blade", "slot": "hand" }
+    },
+    {
+      "id": "long_sword",
+      "name": "Long Sword",
+      "description": "A versatile two-handed blade with impressive reach. Requires strength and training to wield effectively.",
+      "base_price": 60,
+      "quantity": 1,
+      "metadata": { "category": "weapon", "type": "blade", "slot": "two_hand" }
+    },
+    {
+      "id": "shield",
+      "name": "Shield",
+      "description": "A sturdy kite shield reinforced with iron banding. Offers solid protection against most physical attacks.",
+      "base_price": 40,
+      "quantity": 1,
+      "metadata": { "category": "armor", "type": "shield", "slot": "offhand" }
+    },
+    {
+      "id": "buckler",
+      "name": "Buckler",
+      "description": "A small, lightweight round shield strapped to the forearm. Less protective than a full shield but allows freer movement.",
+      "base_price": 18,
+      "quantity": 1,
+      "metadata": { "category": "armor", "type": "shield", "slot": "offhand" }
+    },
+    {
+      "id": "red_potion",
+      "name": "Red Potion",
+      "description": "A bubbling crimson liquid sealed in a small glass vial. Rumored to restore vitality to those who drink it.",
+      "base_price": 15,
+      "quantity": 1,
+      "metadata": { "category": "consumable", "type": "potion", "color": "red" }
+    },
+    {
+      "id": "yellow_potion",
+      "name": "Yellow Potion",
+      "description": "A bright golden brew that glows faintly in the dark. Merchants are tight-lipped about exactly what it does.",
+      "base_price": 20,
+      "quantity": 1,
+      "metadata": { "category": "consumable", "type": "potion", "color": "yellow" }
+    },
+    {
+      "id": "blue_potion",
+      "name": "Blue Potion",
+      "description": "A cool, shimmering azure liquid that smells faintly of the sea. Said to sharpen the mind of its drinker.",
+      "base_price": 20,
+      "quantity": 1,
+      "metadata": { "category": "consumable", "type": "potion", "color": "blue" }
+    },
+    {
+      "id": "green_potion",
+      "name": "Green Potion",
+      "description": "A thick, murky green concoction with a pungent herbal odor. Its effects are unpredictable — use with caution.",
+      "base_price": 12,
+      "quantity": 1,
+      "metadata": { "category": "consumable", "type": "potion", "color": "green" }
+    },
+    {
+      "id": "iron_helmet",
+      "name": "Iron Helmet",
+      "description": "A simple iron cap that protects the skull and temples. Functional but unadorned — soldiers ware, not nobles.",
+      "base_price": 30,
+      "quantity": 1,
+      "metadata": { "category": "armor", "type": "heavy", "slot": "head" }
+    },
+    {
+      "id": "iron_chest",
+      "name": "Iron Chestplate",
+      "description": "A solid iron breastplate hammered to fit a broad frame. Heavy and slow but capable of deflecting a direct blow.",
+      "base_price": 80,
+      "quantity": 1,
+      "metadata": { "category": "armor", "type": "heavy", "slot": "chest" }
+    },
+    {
+      "id": "iron_plates",
+      "name": "Iron Leg Plates",
+      "description": "Articulated iron plates that protect the thighs and shins. Pairs with the chestplate for full iron coverage.",
+      "base_price": 55,
+      "quantity": 1,
+      "metadata": { "category": "armor", "type": "heavy", "slot": "legs" }
+    },
+    {
+      "id": "leather_hood",
+      "name": "Leather Hood",
+      "description": "A supple hood of cured leather that covers the head and neck. Light enough to wear for hours without fatigue.",
+      "base_price": 12,
+      "quantity": 1,
+      "metadata": { "category": "armor", "type": "light", "slot": "head" }
+    },
+    {
+      "id": "leather_vest",
+      "name": "Leather Vest",
+      "description": "A fitted vest of hardened leather, padded at the shoulders. The preferred torso armor for scouts and merchants.",
+      "base_price": 22,
+      "quantity": 1,
+      "metadata": { "category": "armor", "type": "light", "slot": "chest" }
+    },
+    {
+      "id": "leather_leggings",
+      "name": "Leather Leggings",
+      "description": "Flexible leather trousers reinforced with extra stitching at the knees. Comfortable and quietly protective.",
+      "base_price": 18,
+      "quantity": 1,
+      "metadata": { "category": "armor", "type": "light", "slot": "legs" }
+    },
+    {
+      "id": "bow",
+      "name": "Bow",
+      "description": "A recurve bow carved from yew wood. Accurate at range and deadly in practiced hands. Requires arrows.",
+      "base_price": 45,
+      "quantity": 1,
+      "metadata": { "category": "weapon", "type": "ranged", "slot": "two_hand" }
+    },
+    {
+      "id": "arrows",
+      "name": "Arrows",
+      "description": "A bundle of twenty fletched arrows with iron tips. Standard ammunition sold by every reputable fletcher.",
+      "base_price": 10,
+      "quantity": 20,
+      "metadata": { "category": "weapon", "type": "ammunition", "slot": "quiver" }
+    },
+    {
+      "id": "meat",
+      "name": "Roasted Meat",
+      "description": "A thick cut of roasted game meat wrapped in cloth. Still warm from the cookfire and filling on a cold night.",
+      "base_price": 4,
+      "quantity": 1,
+      "metadata": { "category": "consumable", "type": "food" }
+    },
+    {
+      "id": "cheese",
+      "name": "Cheese Wedge",
+      "description": "A dense wedge of aged hard cheese with a sharp, nutty flavor. Keeps well on long journeys.",
+      "base_price": 3,
+      "quantity": 1,
+      "metadata": { "category": "consumable", "type": "food" }
+    },
+    {
+      "id": "water_bottle",
+      "name": "Water Bottle",
+      "description": "A sealed clay bottle filled with clean spring water. Plain but essential for any traveler.",
+      "base_price": 2,
+      "quantity": 1,
+      "metadata": { "category": "consumable", "type": "drink" }
+    },
+    {
+      "id": "wine_bottle",
+      "name": "Wine Bottle",
+      "description": "A dark glass bottle of rough tavern wine, corked and sealed with wax. Not refined, but it does the job.",
+      "base_price": 7,
+      "quantity": 1,
+      "metadata": { "category": "consumable", "type": "drink" }
+    },
+    {
+      "id": "lost_crown",
+      "name": "The Lost Crown",
+      "description": "A legendary relic of tarnished gold and cracked gemstones, said to have once sat upon the brow of King Aldric the Undying. It vanished the night his kingdom fell and resurfaced here — priced at an insult to anyone who truly knows its worth. Rumors say whoever returns it to its rightful throne will be rewarded beyond measure.",
+      "base_price": 10000,
+      "quantity": 1,
+      "metadata": { "category": "relic", "type": "legendary", "slot": "head", "unique": "true" }
+    }
+  ]
+}
