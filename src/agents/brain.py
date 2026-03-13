@@ -15,7 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from smolagents import Tool, LiteLLMModel, CodeAgent
+from smolagents import Tool, LiteLLMModel, ToolCallingAgent
 
 from src.models.schema import Actor, Item, Map, TradeProposal
 from src.simulation import physics
@@ -85,6 +85,7 @@ class ObserveSurroundingsTool(Tool):
 			"type": "integer",
 			"description": "How far to look (in tiles). Default is 10.",
 			"default": 10,
+			"nullable": True,
 		}
 	}
 	output_type = "string"
@@ -167,10 +168,14 @@ class ProposeTradeTool(Tool):
 				"Comma-separated item ids from YOUR inventory that you are offering. "
 				"Leave empty or pass empty string if offering only gold."
 			),
+			"default": "",
+			"nullable": True,
 		},
 		"offered_gold": {
 			"type": "integer",
 			"description": "Amount of gold you are offering. Use 0 if offering no gold.",
+			"default": 0,
+			"nullable": True,
 		},
 		"requested_item_ids": {
 			"type": "string",
@@ -178,10 +183,14 @@ class ProposeTradeTool(Tool):
 				"Comma-separated item ids from the TARGET'S inventory that you want. "
 				"Leave empty or pass empty string if requesting only gold."
 			),
+			"default": "",
+			"nullable": True,
 		},
 		"requested_gold": {
 			"type": "integer",
 			"description": "Amount of gold you are requesting. Use 0 if requesting no gold.",
+			"default": 0,
+			"nullable": True,
 		},
 	}
 	output_type = "string"
@@ -371,7 +380,7 @@ class AgentBrain:
 	"""AI brain for an autonomous actor.
 
 	Holds:
-	- A Smolagents CodeAgent backed by any LiteLLM-compatible model
+	- A Smolagents ToolCallingAgent backed by any LiteLLM-compatible model
 	- A RelationshipMemory so the LLM can recall past interactions
 	- evaluate_trade_proposal(): called by the engine when *this* actor
 	  is the target of a trade so the LLM decides accept/decline
@@ -400,10 +409,10 @@ class AgentBrain:
 			ProposeTradeTool(actor=actor, world_map=world_map, engine=engine, memory=self.memory),
 		]
 
-		self.agent = CodeAgent(
+		self.agent = ToolCallingAgent(
 			tools=self.tools,
 			model=self.model,
-			system_prompt=system_prompt,
+			instructions=system_prompt,
 			max_steps=3,
 		)
 

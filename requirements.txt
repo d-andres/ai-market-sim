@@ -14,10 +14,5 @@ uvicorn[standard]>=0.29
 nicegui>=1.4
 
 # ── Agentic framework (LLM decision-making) ───────────────────────────────────
-smolagents>=1.0
-
-# ── LLM provider (default: OpenAI-compatible) ─────────────────────────────────
-openai>=1.0
-
-# ── Local LLM support (Ollama) ────────────────────────────────────────────────
-ollama>=0.1.0
+# [litellm] extra bundles LiteLLM, which handles all provider routing (Ollama, OpenAI, etc.)
+smolagents[litellm]>=1.0

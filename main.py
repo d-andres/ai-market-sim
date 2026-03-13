@@ -6,6 +6,8 @@ on purpose: all domain logic lives in ``data/`` and (later) ``src/agents/``.
 """
 
 import os
+import threading
+import time
 
 from fastapi import FastAPI
 from nicegui import ui
@@ -60,15 +62,34 @@ engine = initialize_engine(
 )
 
 
+manual_tick = _env_bool("MANUAL_TICK", False)
+
+
+def advance_tick() -> None:
+    """Advance the simulation by one tick (used by the UI button and auto-loop)."""
+    engine.tick()
+
+
+def _tick_loop() -> None:
+    """Background thread: advances the simulation at the configured tick rate."""
+    while True:
+        try:
+            advance_tick()
+        except Exception:  # noqa: BLE001 — keep the loop alive on errors
+            pass
+        time.sleep(engine.tick_rate)
+
+
+if not manual_tick:
+    _ticker = threading.Thread(target=_tick_loop, daemon=True)
+    _ticker.start()
+
+
 def get_world_snapshot() -> dict:
     """Return the current world state as a serializable snapshot.
-    
-    Includes physics data: actor FOV, pathfinding results.
-    Advances the simulation by one tick each call.
+
+    Reads state only — ticking happens on the background thread.
     """
-    # Tick the engine (advance simulation by one step).
-    engine.tick()
-    
     # Compute physics data for each actor.
     actor_data = []
     for actor in DEFAULT_MARKET.actors:
@@ -125,7 +146,7 @@ def get_world_snapshot() -> dict:
     }
 
 
-register_pages(get_world_snapshot)
+register_pages(get_world_snapshot, advance_tick=advance_tick, manual_tick=manual_tick)
 ui.run_with(app, storage_secret="ai-market-sim-dev-secret")
 
 
