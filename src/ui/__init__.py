@@ -31,13 +31,11 @@ def register_pages(get_world_snapshot: Callable[[], dict], advance_tick: Callabl
 		world_url = f"{base_url}/world"
 		health_url = f"{base_url}/health"
 
-		with ui.card().classes("w-full"):
-			ui.label("Direct API URLs").classes("text-base font-bold")
-			ui.label("Copy these if Spaces wrapper blocks link navigation.").classes(
-				"text-xs text-gray-700"
-			)
-			ui.input("/world", value=world_url).props("readonly").classes("w-full")
-			ui.input("/health", value=health_url).props("readonly").classes("w-full")
+		with ui.card().classes("w-full py-1 px-3"):
+			with ui.row().classes("w-full items-center gap-3 flex-wrap"):
+				ui.label("API:").classes("text-xs text-gray-500 font-bold")
+				ui.input(value=world_url).props("readonly dense").classes("flex-1 text-xs")
+				ui.input(value=health_url).props("readonly dense").classes("flex-1 text-xs")
 
 		world_state = get_world_snapshot()
 
@@ -65,6 +63,12 @@ def register_pages(get_world_snapshot: Callable[[], dict], advance_tick: Callabl
 				tick_label = ui.label(
 					f"Tick: {world_state['tick']} | Time: {world_state['elapsed_time_formatted']}"
 				).classes("text-lg font-mono flex-1")
+				llm_label = ui.label(
+					f"LLM calls: {world_state.get('llm_calls', 0)}"
+				).classes("text-sm font-mono text-yellow-400").style("background:#1a1a1a;padding:2px 8px;border-radius:4px")
+				thinking_label = ui.label("").classes("text-sm font-mono text-cyan-400").style(
+					"background:#0a1a2a;padding:2px 8px;border-radius:4px"
+				)
 				status_label = ui.label("Ready").classes("text-sm font-bold")
 				if manual_tick and advance_tick is not None:
 					ui.button("▶ Next Tick", on_click=next_tick).classes("bg-blue-600 text-white")
@@ -78,19 +82,33 @@ def register_pages(get_world_snapshot: Callable[[], dict], advance_tick: Callabl
 
 		# ── Recent events ──────────────────────────────────────────────────────
 		with ui.card().classes("w-full mt-3"):
-			ui.label("Recent Events").classes("text-xl font-bold")
-			ui.label("Last 10 events from the simulation.").classes("text-sm text-gray-700")
-			event_log_label = ui.label("\n".join(
-				[f"[{e['tick']:03d}] {e['actor_id']}: {e['description']}"
-				 for e in world_state.get("recent_events", [])]
-			) or "[system] No events yet").classes("font-mono text-sm whitespace-pre overflow-auto max-h-64")
+			ui.label("Event Log").classes("text-xl font-bold")
+			initial_lines = "\n".join(
+				f"[{e['tick']:03d}] {e['actor_id']}: {e['description']}"
+				for e in world_state.get("recent_events", [])
+			) or "[system] No events yet"
+			event_log_label = ui.label(initial_lines).classes(
+				"font-mono text-xs whitespace-pre overflow-auto w-full"
+			).style("max-height:300px;overflow-y:auto;background:#0a0a0a;color:#aaa;padding:0.5rem;border-radius:4px")
 
 		def refresh_map() -> None:
 			snapshot = get_world_snapshot()
 			update_map_view(map_label, snapshot["ascii"])
 			json_label.set_text(json.dumps(snapshot, indent=2))
 			tick_label.set_text(f"Tick: {snapshot['tick']} | Time: {snapshot['elapsed_time_formatted']}")
-			status_label.set_text("✓ Updated")
+			llm_label.set_text(f"LLM calls: {snapshot.get('llm_calls', 0)}")
+			pending = snapshot.get("llm_pending_actors", [])
+			if pending:
+				names = ", ".join(pending)
+				thinking_label.set_text(f"🧠 {names}...")
+				thinking_label.set_visibility(True)
+				if not tick_running.get("value"):
+					status_label.set_text("⏳ LLM thinking...")
+			else:
+				thinking_label.set_text("")
+				thinking_label.set_visibility(False)
+				if not tick_running.get("value"):
+					status_label.set_text("✓ Updated")
 			event_lines = [
 				f"[{e['tick']:03d}] {e['actor_id']}: {e['description']}"
 				for e in snapshot.get("recent_events", [])
@@ -99,11 +117,11 @@ def register_pages(get_world_snapshot: Callable[[], dict], advance_tick: Callabl
 
 		# ── State inspector ────────────────────────────────────────────────────
 		with ui.card().classes("w-full mt-3"):
-			ui.label("State Inspector").classes("text-xl font-bold")
-			ui.label("Live JSON snapshot.").classes("text-sm text-gray-700")
-			json_label = ui.label(json.dumps(world_state, indent=2)).classes(
-				"font-mono text-xs whitespace-pre overflow-auto max-h-72"
-			)
+			with ui.expansion("State Inspector", value=False).classes("w-full"):
+				ui.label("Live JSON snapshot.").classes("text-xs text-gray-500")
+				json_label = ui.label(json.dumps(world_state, indent=2)).classes(
+					"font-mono text-xs whitespace-pre overflow-auto max-h-72"
+				)
 
 		# ── Physics debug ──────────────────────────────────────────────────────
 		with ui.card().classes("w-full mt-3"):

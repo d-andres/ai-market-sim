@@ -12,14 +12,15 @@ See AI-AGENT-INTEGRATION.md for setup instructions.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from smolagents import Tool, LiteLLMModel, ToolCallingAgent
+from smolagents import Tool, LiteLLMModel, ChatMessage, MessageRole
 
-from src.models.schema import Actor, Item, Map, TradeProposal
+from src.models.schema import Actor, Map, PlannedAction, TradeProposal
 from src.simulation import physics
 from src.agents.prompts import TRADE_EVALUATION_PROMPT, get_system_prompt_for_role
+from src.agents.response_parser import parse_plan, parse_trade_decision
 
 if TYPE_CHECKING:
 	from src.simulation.engine import SimulationEngine
@@ -141,236 +142,6 @@ class ObserveSurroundingsTool(Tool):
 		return "\n".join(lines)
 
 
-class ProposeTradeTool(Tool):
-	"""Tool to propose a trade to a nearby actor.
-
-	The *proposer* specifies what they offer and what they want.
-	The target actor's LLM brain then evaluates the deal autonomously
-	based on their personality, item values, and relationship history.
-	"""
-
-	name = "propose_trade"
-	description = (
-		"Propose a trade to another actor who is nearby. "
-		"Specify the target actor's id, what you are offering (item ids and/or gold), "
-		"and what you are requesting from them (item ids and/or gold). "
-		"The other actor will decide whether to accept or decline based on their own judgment. "
-		"Returns the outcome and what they said."
-	)
-	inputs = {
-		"target_actor_id": {
-			"type": "string",
-			"description": "The id of the actor you want to trade with.",
-		},
-		"offered_item_ids": {
-			"type": "string",
-			"description": (
-				"Comma-separated item ids from YOUR inventory that you are offering. "
-				"Leave empty or pass empty string if offering only gold."
-			),
-			"default": "",
-			"nullable": True,
-		},
-		"offered_gold": {
-			"type": "integer",
-			"description": "Amount of gold you are offering. Use 0 if offering no gold.",
-			"default": 0,
-			"nullable": True,
-		},
-		"requested_item_ids": {
-			"type": "string",
-			"description": (
-				"Comma-separated item ids from the TARGET'S inventory that you want. "
-				"Leave empty or pass empty string if requesting only gold."
-			),
-			"default": "",
-			"nullable": True,
-		},
-		"requested_gold": {
-			"type": "integer",
-			"description": "Amount of gold you are requesting. Use 0 if requesting no gold.",
-			"default": 0,
-			"nullable": True,
-		},
-	}
-	output_type = "string"
-
-	def __init__(
-		self,
-		actor: Actor,
-		world_map: Map,
-		engine: SimulationEngine,
-		memory: RelationshipMemory,
-		**kwargs,
-	):
-		super().__init__(**kwargs)
-		self.actor = actor
-		self.world_map = world_map
-		self.engine = engine
-		self.memory = memory
-
-	def _resolve_items(
-		self, id_string: str, owner: Actor
-	) -> tuple[list[Item], str | None]:
-		"""Parse a comma-separated item id string against an actor's inventory.
-
-		Returns (matched_items, error_message).  error_message is None on success.
-		"""
-		if not id_string or not id_string.strip():
-			return [], None
-		wanted = [s.strip() for s in id_string.split(",") if s.strip()]
-		inv_by_id = {item.id: item for item in owner.inventory}
-		matched: list[Item] = []
-		for iid in wanted:
-			if iid not in inv_by_id:
-				return [], f"{owner.name} does not have item '{iid}' in their inventory."
-			matched.append(inv_by_id[iid])
-		return matched, None
-
-	def forward(
-		self,
-		target_actor_id: str,
-		offered_item_ids: str = "",
-		offered_gold: int = 0,
-		requested_item_ids: str = "",
-		requested_gold: int = 0,
-	) -> str:
-		# --- Validate target exists and is nearby ---
-		target = next(
-			(a for a in self.world_map.actors if a.id == target_actor_id), None
-		)
-		if target is None:
-			return f"No actor with id '{target_actor_id}' found."
-
-		dist = physics.distance_chebyshev(
-			self.actor.x, self.actor.y, target.x, target.y
-		)
-		if dist > 2:
-			return (
-				f"{target.name} is too far away ({dist} tiles). "
-				"Move closer before proposing a trade."
-			)
-
-		# --- Validate gold ---
-		if offered_gold > self.actor.gold:
-			return (
-				f"You only have {self.actor.gold}g but are trying to offer {offered_gold}g."
-			)
-		if requested_gold > target.gold:
-			return (
-				f"{target.name} only has {target.gold}g but you are requesting {requested_gold}g."
-			)
-
-		# --- Validate items exist in correct inventories ---
-		offered_items, err = self._resolve_items(offered_item_ids, self.actor)
-		if err:
-			return err
-		requested_items, err = self._resolve_items(requested_item_ids, target)
-		if err:
-			return err
-
-		proposal = TradeProposal(
-			proposer_id=self.actor.id,
-			target_id=target.id,
-			offered_items=offered_items,
-			offered_gold=offered_gold,
-			requested_items=requested_items,
-			requested_gold=requested_gold,
-		)
-
-		# --- Route to the target's brain for LLM evaluation ---
-		outcome = self.engine.evaluate_trade_proposal(
-			proposal=proposal,
-			proposer=self.actor,
-			target=target,
-		)
-		return outcome
-
-
-class MoveTool(Tool):
-	"""Tool for an actor to move in a direction."""
-	
-	name = "move"
-	description = (
-		"Move in a specified direction. Valid directions are: "
-		"north, south, east, west, northeast, northwest, southeast, southwest. "
-		"Returns success or failure message."
-	)
-	inputs = {
-		"direction": {
-			"type": "string",
-			"description": "Direction to move (north, south, east, west, northeast, northwest, southeast, southwest)",
-		}
-	}
-	output_type = "string"
-	
-	def __init__(self, actor: Actor, world_map: Map, engine: SimulationEngine, **kwargs):
-		super().__init__(**kwargs)
-		self.actor = actor
-		self.world_map = world_map
-		self.engine = engine
-	
-	def forward(self, direction: str) -> str:
-		"""Execute the move."""
-		direction = direction.lower().strip()
-		
-		if direction not in physics.DIRECTIONS_8:
-			valid = ", ".join(physics.DIRECTIONS_8.keys())
-			return f"Invalid direction. Valid directions are: {valid}"
-		
-		dx, dy = physics.DIRECTIONS_8[direction]
-		new_x = self.actor.x + dx
-		new_y = self.actor.y + dy
-		
-		# Check if move is valid
-		if not physics.can_move_to(self.world_map, new_x, new_y, exclude_actor_id=self.actor.id):
-			blocking = physics.get_blocking_actor(self.world_map, new_x, new_y)
-			if blocking:
-				return f"Cannot move {direction}: blocked by {blocking.name}"
-			return f"Cannot move {direction}: tile is not walkable (wall or out of bounds)"
-		
-		# Execute move
-		old_x, old_y = self.actor.x, self.actor.y
-		self.actor.x = new_x
-		self.actor.y = new_y
-		
-		# Log event
-		self.engine._log_event(
-			actor_id=self.actor.id,
-			event_type="move",
-			description=f"{self.actor.name} moved {direction} from ({old_x},{old_y}) to ({new_x},{new_y})",
-			data={"from": (old_x, old_y), "to": (new_x, new_y), "direction": direction}
-		)
-		
-		return f"Successfully moved {direction} to ({new_x}, {new_y})"
-
-
-class WaitTool(Tool):
-	"""Tool for an actor to wait and observe without moving."""
-	
-	name = "wait"
-	description = (
-		"Wait for one turn without taking action. "
-		"Useful when you want to observe without moving or need to think about your next action."
-	)
-	inputs = {}
-	output_type = "string"
-	
-	def __init__(self, actor: Actor, engine: SimulationEngine, **kwargs):
-		super().__init__(**kwargs)
-		self.actor = actor
-		self.engine = engine
-	
-	def forward(self) -> str:
-		"""Execute the wait."""
-		self.engine._log_event(
-			actor_id=self.actor.id,
-			event_type="wait",
-			description=f"{self.actor.name} is waiting and observing",
-			data={}
-		)
-		return "You wait and observe your surroundings."
-
 
 # ---------------------------------------------------------------------------
 # Agent brain
@@ -379,12 +150,18 @@ class WaitTool(Tool):
 class AgentBrain:
 	"""AI brain for an autonomous actor.
 
-	Holds:
-	- A Smolagents ToolCallingAgent backed by any LiteLLM-compatible model
-	- A RelationshipMemory so the LLM can recall past interactions
-	- evaluate_trade_proposal(): called by the engine when *this* actor
-	  is the target of a trade so the LLM decides accept/decline
+	Responsible for:
+	- Observing the world (via ObserveSurroundingsTool)
+	- Producing a multi-step plan as a list of PlannedAction objects (via create_plan())
+	- Evaluating incoming trade proposals from other actors (via evaluate_trade_proposal())
+
+	The engine calls create_plan() once whenever an actor has no outstanding plan
+	or was interrupted.  Execution of each step happens entirely inside the engine
+	so that no LLM call is required for step-by-step execution.
 	"""
+
+	# How many steps the LLM is asked to plan at once.
+	PLAN_HORIZON: int = 8
 
 	def __init__(
 		self,
@@ -400,46 +177,61 @@ class AgentBrain:
 		self.memory = RelationshipMemory()
 
 		self.model = LiteLLMModel(model_id=model_name, api_base=api_base)
-		system_prompt = get_system_prompt_for_role(actor.role)
-
-		self.tools = [
-			ObserveSurroundingsTool(actor=actor, world_map=world_map, memory=self.memory),
-			MoveTool(actor=actor, world_map=world_map, engine=engine),
-			WaitTool(actor=actor, engine=engine),
-			ProposeTradeTool(actor=actor, world_map=world_map, engine=engine, memory=self.memory),
-		]
-
-		self.agent = ToolCallingAgent(
-			tools=self.tools,
-			model=self.model,
-			instructions=system_prompt,
-			max_steps=3,
+		self.system_prompt = get_system_prompt_for_role(actor.role)
+		self.obs_tool = ObserveSurroundingsTool(
+			actor=actor, world_map=world_map, memory=self.memory
 		)
 
-	def take_turn(self) -> str:
-		"""Let the agent take one turn (observe, reason, act)."""
+	def create_plan(self, interrupt_reason: str = "") -> tuple[list[PlannedAction], str]:
+		"""Call the LLM once to produce a list of planned actions and a thought summary.
+
+		Returns (plan, summary) where summary is a brief in-character description
+		of the actor's reasoning that gets written to the event log.
+		"""
+		observation = self.obs_tool.forward()
+		inv_summary = (
+			", ".join(f"{i.name} x{i.quantity}" for i in self.actor.inventory)
+			or "nothing"
+		)
+
+		interrupt_ctx = ""
+		if interrupt_reason:
+			interrupt_ctx = (
+				f"\n\n⚠️ INTERRUPT — your previous plan was cancelled because: {interrupt_reason}\n"
+				"Reassess the situation and form a new plan."
+			)
+
+		user_msg = (
+			f"Tick {self.engine.tick_count} | HP: {self.actor.hp} | "
+			f"Gold: {self.actor.gold}g | Carrying: {inv_summary}\n\n"
+			f"WORLD OBSERVATION:\n{observation}"
+			f"{interrupt_ctx}\n\n"
+			f"Create a plan of up to {self.PLAN_HORIZON} steps.\n"
+			"Return ONLY a valid JSON object with exactly two keys:\n"
+			'  "summary": a single sentence (15-25 words) written in third person describing '
+			"your character's thoughts and intended actions in their own voice and personality.\n"
+			'  "plan": a JSON array where each element is one of these shapes:\n'
+			'    {"action_type": "move", "params": {"direction": "north"}, "reason": ""}\n'
+			'    {"action_type": "wait", "params": {}, "reason": ""}\n'
+			'    {"action_type": "propose_trade", "params": {"target_actor_id": "actor_id", '
+			'"offered_gold": 50, "offered_item_ids": "", "requested_item_ids": "item_crown", '
+			'"requested_gold": 0}, "reason": ""}\n'
+			"Valid directions: north, south, east, west, northeast, northwest, southeast, southwest.\n"
+			"No prose outside the JSON. No markdown. Only the JSON object."
+		)
+
+		messages = [
+			ChatMessage(role=MessageRole.SYSTEM, content=[{"type": "text", "text": self.system_prompt}]),
+			ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": user_msg}]),
+		]
+
+		_fallback_summary = f"{self.actor.name} pauses, unsure what to do next."
 		try:
-			inv_summary = (
-				", ".join(f"{i.name} x{i.quantity}" for i in self.actor.inventory)
-				or "nothing"
-			)
-			prompt = (
-				f"You are {self.actor.name}, a {self.actor.role.value}. "
-				f"Tick {self.engine.tick_count}. "
-				f"HP: {self.actor.hp} | Gold: {self.actor.gold}g | Carrying: {inv_summary}. "
-				"Observe your surroundings, then decide what to do. "
-				"If a good trade opportunity is nearby, use propose_trade."
-			)
-			result = self.agent.run(prompt)
-			return f"{self.actor.name}: {result}"
+			response = self.model(messages)
+			content: str = response.content if hasattr(response, "content") else str(response)
+			return parse_plan(content, self.actor.name)
 		except Exception as e:
-			self.engine._log_event(
-				actor_id=self.actor.id,
-				event_type="error",
-				description=f"{self.actor.name} encountered an error: {e}",
-				data={"error": str(e)},
-			)
-			return f"{self.actor.name} failed to act: {e}"
+			return [PlannedAction(action_type="wait", reason=f"Plan generation failed: {e}")], _fallback_summary
 
 	def evaluate_trade_proposal(
 		self,
@@ -486,21 +278,12 @@ class AgentBrain:
 		)
 
 		try:
-			raw: str = self.model(prompt)  # Direct model call, no tool loop needed
+			response = self.model([ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": prompt}])])
+			raw: str = response.content if hasattr(response, "content") else str(response)
 		except Exception as e:
 			return False, f"{self.actor.name} couldn't process the offer right now."
 
-		# Parse two-line response
-		lines = [l.strip() for l in raw.strip().splitlines() if l.strip()]
-		accepted = False
-		spoken = f"{self.actor.name} considers the offer silently."
-		for line in lines:
-			if line.upper().startswith("DECISION:"):
-				accepted = "ACCEPT" in line.upper()
-			elif line.upper().startswith("RESPONSE:"):
-				spoken = line.split(":", 1)[1].strip()
-
-		return accepted, spoken
+		return parse_trade_decision(raw, self.actor.name)
 
 
 def create_agent_for_actor(

@@ -142,7 +142,9 @@ def get_world_snapshot() -> dict:
         ],
         "ascii": render_ascii(DEFAULT_MARKET, show_actors=True),
         "actors": actor_data,
-        "recent_events": engine.get_event_log(limit=10),
+        "recent_events": engine.get_event_log(limit=200),
+        "llm_calls": engine.llm_call_count,
+        "llm_pending_actors": list(engine.llm_pending_actors),
     }
 
 

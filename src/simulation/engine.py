@@ -11,11 +11,13 @@ Phase 3: AI agents control all actor behavior via LLM reasoning.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from src.models.schema import Actor, Map, TradeProposal
+from src.models.schema import Actor, Map, PlannedAction, TradeProposal
+from src.simulation import physics
 
 if TYPE_CHECKING:
 	from src.agents.brain import AgentBrain
@@ -59,6 +61,8 @@ class SimulationEngine:
 		self.start_time = datetime.now()
 		self.events: list[SimulationEvent] = []
 		self.enable_ai = enable_ai
+		self.llm_call_count: int = 0  # total LLM planning calls made
+		self.llm_pending_actors: list[str] = []  # actor names currently waiting on LLM
 		
 		# Initialize AI brains for each actor
 		self.agent_brains: dict[str, AgentBrain] = {}
@@ -110,41 +114,80 @@ class SimulationEngine:
 	def tick(self) -> dict:
 		"""Execute one simulation tick.
 
-		Returns a snapshot of changes during this tick.
-		In Phase 3: Each actor's AI brain takes a turn to reason and act.
+		For each actor:
+		- If they have no plan or were interrupted → LLM planning calls fire in parallel.
+		- Otherwise → pop the next planned action and execute it instantly (no LLM).
 		"""
 		updates = {
 			"tick": self.tick_count,
 			"events": [],
 			"actor_actions": [],
 		}
-		
-		# Give each AI agent a turn
-		if self.enable_ai:
-			for actor in self.world_map.actors:
-				if actor.id in self.agent_brains:
-					try:
-						action_summary = self.agent_brains[actor.id].take_turn()
-						updates["actor_actions"].append({
-							"actor_id": actor.id,
-							"actor_name": actor.name,
-							"summary": action_summary,
-						})
-					except Exception as e:
-						error_msg = f"{actor.name} failed to take turn: {str(e)}"
-						self._log_event(
-							actor_id=actor.id,
-							event_type="error",
-							description=error_msg,
-							data={"error": str(e)}
-						)
-						updates["actor_actions"].append({
-							"actor_id": actor.id,
-							"actor_name": actor.name,
-							"summary": error_msg,
-						})
 
-		# Collect events from this tick.
+		if self.enable_ai:
+			# Split actors into those needing a new plan vs those executing existing steps
+			needs_plan: list = []  # (actor, brain)
+			has_steps: list = []   # actor
+
+			for actor in self.world_map.actors:
+				brain = self.agent_brains.get(actor.id)
+				if not brain:
+					continue
+				if actor.needs_replan or not actor.action_queue:
+					needs_plan.append((actor, brain))
+				else:
+					has_steps.append(actor)
+
+			# —— Fire all planning calls in parallel ——
+			if needs_plan:
+				self.llm_call_count += len(needs_plan)
+				self.llm_pending_actors = [a.name for a, _ in needs_plan]
+
+				def _plan_actor(actor_brain_pair):
+					actor, brain = actor_brain_pair
+					return actor, brain.create_plan(interrupt_reason=actor.interrupt_reason)
+
+				with ThreadPoolExecutor(max_workers=len(needs_plan)) as pool:
+					futures = {pool.submit(_plan_actor, pair): pair[0] for pair in needs_plan}
+					for future in as_completed(futures):
+						actor = futures[future]
+						try:
+							actor, (plan, thought_summary) = future.result()
+							actor.action_queue = plan
+							actor.needs_replan = False
+							actor.interrupt_reason = ""
+							self._log_event(
+								actor_id=actor.id,
+								event_type="plan",
+								description=thought_summary,
+								data={"steps": len(plan)},
+							)
+							updates["actor_actions"].append({
+								"actor_id": actor.id,
+								"actor_name": actor.name,
+								"summary": thought_summary,
+							})
+						except Exception as e:
+							self._log_event(
+								actor_id=actor.id,
+								event_type="error",
+								description=f"{actor.name} failed to plan: {e}",
+								data={"error": str(e)},
+							)
+							actor.action_queue = []
+
+				self.llm_pending_actors = []
+
+			# —— Execute one step for actors with existing plans (sequential, mutates state) ——
+			for actor in has_steps:
+				action = actor.action_queue.pop(0)
+				result = self._execute_action(actor, action)
+				updates["actor_actions"].append({
+					"actor_id": actor.id,
+					"actor_name": actor.name,
+					"summary": result,
+				})
+
 		updates["events"] = [
 			{
 				"tick": e.tick,
@@ -158,6 +201,115 @@ class SimulationEngine:
 
 		self.tick_count += 1
 		return updates
+
+	def interrupt_actor(self, actor_id: str, reason: str) -> None:
+		"""Mark an actor as needing to replan immediately.
+
+		Called when something unexpected happens (blocked, attacked, etc.).
+		Clears the actor's current plan so the LLM is called next tick.
+		"""
+		actor = next((a for a in self.world_map.actors if a.id == actor_id), None)
+		if actor:
+			actor.needs_replan = True
+			actor.interrupt_reason = reason
+			actor.action_queue = []
+			self._log_event(
+				actor_id=actor_id,
+				event_type="interrupt",
+				description=f"{actor.name} interrupted: {reason}",
+				data={"reason": reason},
+			)
+
+	def _execute_action(self, actor: Actor, action: PlannedAction) -> str:
+		"""Execute one planned action step. Returns a description of what happened.
+
+		If the action cannot be completed (e.g. path blocked), interrupt_actor()
+		is called so the LLM replans on the next tick.
+		"""
+		if action.action_type == "move":
+			direction = action.params.get("direction", "").lower().strip()
+			if direction not in physics.DIRECTIONS_8:
+				reason = f"Invalid direction in plan: '{direction}'"
+				self.interrupt_actor(actor.id, reason)
+				return reason
+			dx, dy = physics.DIRECTIONS_8[direction]
+			new_x, new_y = actor.x + dx, actor.y + dy
+			if not physics.can_move_to(self.world_map, new_x, new_y, exclude_actor_id=actor.id):
+				blocking = physics.get_blocking_actor(self.world_map, new_x, new_y)
+				reason = (
+					f"Path blocked by {blocking.name} at ({new_x},{new_y})"
+					if blocking else
+					f"Tile ({new_x},{new_y}) is not walkable"
+				)
+				self.interrupt_actor(actor.id, reason)
+				# Also interrupt the blocker so they react
+				if blocking:
+					self.interrupt_actor(blocking.id, f"{actor.name} tried to move into your tile")
+				return reason
+			old_x, old_y = actor.x, actor.y
+			actor.x, actor.y = new_x, new_y
+			desc = f"{actor.name} moved {direction} from ({old_x},{old_y}) to ({new_x},{new_y})"
+			self._log_event(actor.id, "move", desc, {"from": [old_x, old_y], "to": [new_x, new_y]})
+			return desc
+
+		elif action.action_type == "wait":
+			desc = f"{actor.name} is waiting and observing"
+			self._log_event(actor.id, "wait", desc)
+			return desc
+
+		elif action.action_type == "propose_trade":
+			return self._execute_trade_action(actor, action.params)
+
+		else:
+			return f"Unknown action type: '{action.action_type}'"
+
+	def _execute_trade_action(self, actor: Actor, params: dict) -> str:
+		"""Execute a propose_trade action step."""
+		target_id = params.get("target_actor_id", "")
+		target = next((a for a in self.world_map.actors if a.id == target_id), None)
+		if target is None:
+			reason = f"Trade target '{target_id}' not found"
+			self.interrupt_actor(actor.id, reason)
+			return reason
+
+		dist = physics.distance_chebyshev(actor.x, actor.y, target.x, target.y)
+		if dist > 2:
+			reason = f"{target.name} is {dist} tiles away — need to move closer first"
+			self.interrupt_actor(actor.id, reason)
+			return reason
+
+		offered_gold = int(params.get("offered_gold", 0))
+		requested_gold = int(params.get("requested_gold", 0))
+
+		def _resolve_items(id_str: str, owner: Actor) -> tuple[list, str | None]:
+			if not id_str or not id_str.strip():
+				return [], None
+			inv = {i.id: i for i in owner.inventory}
+			matched = []
+			for iid in [s.strip() for s in id_str.split(",") if s.strip()]:
+				if iid not in inv:
+					return [], f"{owner.name} does not have item '{iid}'"
+				matched.append(inv[iid])
+			return matched, None
+
+		offered_items, err = _resolve_items(params.get("offered_item_ids", ""), actor)
+		if err:
+			self.interrupt_actor(actor.id, err)
+			return err
+		requested_items, err = _resolve_items(params.get("requested_item_ids", ""), target)
+		if err:
+			self.interrupt_actor(actor.id, err)
+			return err
+
+		proposal = TradeProposal(
+			proposer_id=actor.id,
+			target_id=target.id,
+			offered_items=offered_items,
+			offered_gold=offered_gold,
+			requested_items=requested_items,
+			requested_gold=requested_gold,
+		)
+		return self.evaluate_trade_proposal(proposal=proposal, proposer=actor, target=target)
 
 	def get_elapsed_time(self) -> float:
 		"""Get elapsed simulation time in seconds."""

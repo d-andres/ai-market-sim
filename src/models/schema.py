@@ -59,6 +59,14 @@ class Tile(BaseModel):
 		return symbols[self.tile_type]
 
 
+class PlannedAction(BaseModel):
+	"""A single action step in an actor's current plan."""
+
+	action_type: str  # "move", "wait", "propose_trade"
+	params: dict = Field(default_factory=dict)
+	reason: str = ""
+
+
 class Actor(BaseModel):
 	id: str = Field(min_length=1)
 	name: str = Field(min_length=1)
@@ -68,6 +76,10 @@ class Actor(BaseModel):
 	gold: int = Field(default=0, ge=0)
 	hp: int = Field(default=100, ge=0)
 	inventory: list[Item] = Field(default_factory=list)
+	# Reactive planning state
+	action_queue: list[PlannedAction] = Field(default_factory=list)
+	needs_replan: bool = Field(default=True)
+	interrupt_reason: str = ""
 
 
 class Map(BaseModel):
@@ -128,6 +140,7 @@ __all__ = [
 	"TileType",
 	"ActorRole",
 	"Item",
+	"PlannedAction",
 	"Tile",
 	"Actor",
 	"Map",
