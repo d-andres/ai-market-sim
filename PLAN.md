@@ -36,6 +36,8 @@ Keep the world running at a fixed tick rate while LLM planning is in flight, and
 
 ## Phase 1: Non-Blocking Planning Pipeline (Engine)
 
+Status: COMPLETED
+
 ### Changes
 1. Add a persistent planning executor on engine init.
 2. Add per-actor planning runtime state (stored in engine dictionaries keyed by actor id):
@@ -63,6 +65,8 @@ Keep the world running at a fixed tick rate while LLM planning is in flight, and
 - If instability appears, disable background submission path and fall back to synchronous planning while preserving helper methods.
 
 ## Phase 2: Plan Validity and Interrupt Safety
+
+Status: COMPLETED
 
 ### Changes
 1. Increment actor generation on interrupt events.

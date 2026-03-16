@@ -59,6 +59,8 @@ _runtime_state = {
     "ready": False,
     "generating": False,
     "error": "",
+    "initial_plan_expected": 0,
+    "initial_plan_completed": 0,
 }
 
 
@@ -105,10 +107,15 @@ def is_world_ready() -> bool:
 
 def get_generation_status() -> dict:
     with _runtime_lock:
+        expected = int(_runtime_state["initial_plan_expected"])
+        completed = int(_runtime_state["initial_plan_completed"])
         return {
             "ready": bool(_runtime_state["ready"]),
             "generating": bool(_runtime_state["generating"]),
             "error": str(_runtime_state["error"]),
+            "initial_plan_expected": expected,
+            "initial_plan_completed": completed,
+            "awaiting_responses": max(0, expected - completed),
         }
 
 
@@ -119,6 +126,8 @@ def generate_world() -> None:
             return
         _runtime_state["generating"] = True
         _runtime_state["error"] = ""
+        _runtime_state["initial_plan_expected"] = 0
+        _runtime_state["initial_plan_completed"] = 0
 
     try:
         world_map = load_or_build_default_map()
@@ -135,6 +144,11 @@ def generate_world() -> None:
 
         # Warm up: one initial plan per actor so simulation starts with intent.
         if engine.enable_ai:
+            initial_targets = [a for a in world_map.actors if engine.agent_brains.get(a.id)]
+            with _runtime_lock:
+                _runtime_state["initial_plan_expected"] = len(initial_targets)
+                _runtime_state["initial_plan_completed"] = 0
+
             for actor in world_map.actors:
                 brain = engine.agent_brains.get(actor.id)
                 if not brain:
@@ -149,6 +163,8 @@ def generate_world() -> None:
                     description=thought_summary,
                     data={"steps": len(plan), "initial": True},
                 )
+                with _runtime_lock:
+                    _runtime_state["initial_plan_completed"] += 1
 
         with _runtime_lock:
             _runtime_state["world_map"] = world_map
@@ -156,11 +172,21 @@ def generate_world() -> None:
             _runtime_state["ready"] = True
             _runtime_state["generating"] = False
             _runtime_state["error"] = ""
+            _runtime_state["initial_plan_expected"] = 0
+            _runtime_state["initial_plan_completed"] = 0
     except Exception as exc:  # noqa: BLE001
         with _runtime_lock:
             _runtime_state["ready"] = False
             _runtime_state["generating"] = False
             _runtime_state["error"] = str(exc)
+
+
+def start_generation() -> None:
+    """Start world generation in the background to keep UI responsive."""
+    with _runtime_lock:
+        if _runtime_state["ready"] or _runtime_state["generating"]:
+            return
+    threading.Thread(target=generate_world, daemon=True).start()
 
 
 def advance_tick() -> None:
@@ -287,7 +313,7 @@ register_pages(
     advance_tick=advance_tick,
     manual_tick=manual_tick,
     is_world_ready=is_world_ready,
-    start_generation=generate_world,
+    start_generation=start_generation,
     get_generation_status=get_generation_status,
 )
 ui.run_with(app, storage_secret="ai-market-sim-dev-secret")

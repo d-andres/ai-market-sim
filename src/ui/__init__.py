@@ -51,6 +51,7 @@ def register_pages(
 				"ready": False,
 				"generating": False,
 				"error": "",
+				"awaiting_responses": 0,
 			}
 
 			ui.label("⚔  AI MARKET SIM  ⚔").style(
@@ -63,18 +64,26 @@ def register_pages(
 				status_label = ui.label("").style(
 					"font-family:'VT323',monospace;font-size:1.1rem;color:#7a7a7a;"
 				)
+				progress_label = ui.label("").style(
+					"font-family:'VT323',monospace;font-size:1.05rem;color:#4caf50;"
+				)
 				error_label = ui.label("").style(
 					"font-family:'VT323',monospace;font-size:1rem;color:#ff6666;"
 				)
+				generate_button = {"el": None}
 
 				def _start_generate() -> None:
+					if generate_button["el"] is not None:
+						generate_button["el"].props("disable")
 					if start_generation is not None:
 						start_generation()
 
 				if not status.get("generating") and not status.get("ready") and start_generation is not None:
-					ui.button("GENERATE MAP", on_click=_start_generate).style(
+					generate_button["el"] = ui.button("GENERATE MAP", on_click=_start_generate).style(
 						"font-family:'VT323',monospace;font-size:1.2rem;background:#0d200d;color:#4caf50;border:1px solid #2d6a2d;"
 					)
+					if status.get("generating"):
+						generate_button["el"].props("disable")
 
 				def _refresh_generation_status() -> None:
 					latest = get_generation_status() if get_generation_status is not None else status
@@ -83,8 +92,12 @@ def register_pages(
 						return
 					if latest.get("generating"):
 						status_label.set_text("Loading... generating map, populating actors, and requesting initial plans.")
+						progress_label.set_text(f"Awaiting {latest.get('awaiting_responses', 0)} AI responses")
+						if generate_button["el"] is not None:
+							generate_button["el"].props("disable")
 					else:
 						status_label.set_text("World not initialized. Click GENERATE MAP to begin.")
+						progress_label.set_text("")
 					error_label.set_text(latest.get("error") or "")
 
 				_refresh_generation_status()

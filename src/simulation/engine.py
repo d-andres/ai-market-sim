@@ -66,6 +66,10 @@ class SimulationEngine:
 		self._plan_executor = ThreadPoolExecutor(max_workers=max(1, len(self.world_map.actors)))
 		self._pending_plan_futures: dict[str, Future] = {}
 		self._pending_plan_started_tick: dict[str, int] = {}
+		self._plan_generation: dict[str, int] = {a.id: 0 for a in self.world_map.actors}
+		self._pending_plan_generation: dict[str, int] = {}
+		self.stale_plan_discard_count: int = 0
+		self.applied_plan_count: int = 0
 		
 		# Initialize AI brains for each actor
 		self.agent_brains: dict[str, AgentBrain] = {}
@@ -86,6 +90,7 @@ class SimulationEngine:
 					api_base=api_base,
 				)
 				self.agent_brains[actor.id] = brain
+				self._plan_generation.setdefault(actor.id, 0)
 				self._log_event(
 					actor_id=actor.id,
 					event_type="init",
@@ -123,15 +128,17 @@ class SimulationEngine:
 		if actor.id in self._pending_plan_futures:
 			return
 		interrupt_reason = actor.interrupt_reason
+		generation = self._plan_generation.get(actor.id, 0)
 		future = self._plan_executor.submit(brain.create_plan, interrupt_reason)
 		self._pending_plan_futures[actor.id] = future
 		self._pending_plan_started_tick[actor.id] = self.tick_count
+		self._pending_plan_generation[actor.id] = generation
 		self.llm_call_count += 1
 		self._log_event(
 			actor_id=actor.id,
 			event_type="plan_submitted",
 			description=f"{actor.name} requested a new plan",
-			data={"interrupt_reason": interrupt_reason},
+			data={"interrupt_reason": interrupt_reason, "generation": generation},
 		)
 
 	def _collect_completed_plan_requests(self, updates: dict) -> None:
@@ -144,6 +151,26 @@ class SimulationEngine:
 			if actor is None:
 				self._pending_plan_futures.pop(actor_id, None)
 				self._pending_plan_started_tick.pop(actor_id, None)
+				self._pending_plan_generation.pop(actor_id, None)
+				continue
+
+			submitted_generation = self._pending_plan_generation.get(actor_id, 0)
+			current_generation = self._plan_generation.get(actor_id, 0)
+			if submitted_generation != current_generation:
+				# Actor state changed while planning; discard stale result safely.
+				self.stale_plan_discard_count += 1
+				self._log_event(
+					actor_id=actor.id,
+					event_type="plan_discarded_stale",
+					description=f"Discarded stale plan for {actor.name}",
+					data={
+						"submitted_generation": submitted_generation,
+						"current_generation": current_generation,
+					},
+				)
+				self._pending_plan_futures.pop(actor_id, None)
+				self._pending_plan_started_tick.pop(actor_id, None)
+				self._pending_plan_generation.pop(actor_id, None)
 				continue
 
 			try:
@@ -151,11 +178,12 @@ class SimulationEngine:
 				actor.action_queue = plan
 				actor.needs_replan = False
 				actor.interrupt_reason = ""
+				self.applied_plan_count += 1
 				self._log_event(
 					actor_id=actor.id,
 					event_type="plan",
 					description=thought_summary,
-					data={"steps": len(plan)},
+					data={"steps": len(plan), "generation": current_generation},
 				)
 				updates["actor_actions"].append({
 					"actor_id": actor.id,
@@ -174,6 +202,7 @@ class SimulationEngine:
 
 			self._pending_plan_futures.pop(actor_id, None)
 			self._pending_plan_started_tick.pop(actor_id, None)
+			self._pending_plan_generation.pop(actor_id, None)
 
 	def tick(self) -> dict:
 		"""Execute one simulation tick.
@@ -242,10 +271,12 @@ class SimulationEngine:
 		"""
 		actor = next((a for a in self.world_map.actors if a.id == actor_id), None)
 		if actor:
+			self._plan_generation[actor_id] = self._plan_generation.get(actor_id, 0) + 1
 			pending = self._pending_plan_futures.pop(actor_id, None)
 			if pending is not None and not pending.done():
 				pending.cancel()
 			self._pending_plan_started_tick.pop(actor_id, None)
+			self._pending_plan_generation.pop(actor_id, None)
 			actor.needs_replan = True
 			actor.interrupt_reason = reason
 			actor.action_queue = []
