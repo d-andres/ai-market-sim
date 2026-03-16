@@ -8,12 +8,14 @@ on purpose: all domain logic lives in ``data/`` and (later) ``src/agents/``.
 import os
 import threading
 import time
+from threading import Lock
 
 from fastapi import FastAPI
 from nicegui import ui
 
-from data import DEFAULT_MARKET, render_ascii
+from data import load_or_build_default_map, render_ascii
 from src.ui import register_pages
+from src.models.schema import Actor, ActorRole
 from src.simulation.physics import get_visible_tiles_and_actors, breadth_first_search
 from src.simulation.engine import initialize_engine
 
@@ -50,34 +52,138 @@ def _env_bool(name: str, default: bool) -> bool:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
-# Initialize the simulation engine with AI enabled.
-# Set enable_ai=False to disable AI agents for testing.
-# See AI-AGENT-INTEGRATION.md for LLM provider setup instructions.
-engine = initialize_engine(
-    DEFAULT_MARKET,
-    tick_rate=float(os.getenv("TICK_RATE", "2.0")),
-    enable_ai=_env_bool("ENABLE_AI", True),
-    ollama_model=os.getenv("LLM_MODEL", "ollama/llama3.2"),
-    ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
-)
+_runtime_lock = Lock()
+_runtime_state = {
+    "world_map": None,
+    "engine": None,
+    "ready": False,
+    "generating": False,
+    "error": "",
+}
 
 
 manual_tick = _env_bool("MANUAL_TICK", False)
 
 
+def _default_actors() -> list[Actor]:
+    """Create default actor population used when a map has no actors."""
+    return [
+        Actor(
+            id="guard_1",
+            name="Guard Thorne",
+            role=ActorRole.GUARD,
+            x=5,
+            y=5,
+            gold=50,
+            hp=100,
+        ),
+        Actor(
+            id="shopkeeper_1",
+            name="Merchant Elara",
+            role=ActorRole.SHOPKEEPER,
+            x=10,
+            y=3,
+            gold=200,
+            hp=80,
+        ),
+        Actor(
+            id="player",
+            name="Adventurer",
+            role=ActorRole.PLAYER,
+            x=10,
+            y=10,
+            gold=0,
+            hp=100,
+        ),
+    ]
+
+
+def is_world_ready() -> bool:
+    with _runtime_lock:
+        return bool(_runtime_state["ready"])
+
+
+def get_generation_status() -> dict:
+    with _runtime_lock:
+        return {
+            "ready": bool(_runtime_state["ready"]),
+            "generating": bool(_runtime_state["generating"]),
+            "error": str(_runtime_state["error"]),
+        }
+
+
+def generate_world() -> None:
+    """Generate map, initialize engine, and run initial planning before going live."""
+    with _runtime_lock:
+        if _runtime_state["ready"] or _runtime_state["generating"]:
+            return
+        _runtime_state["generating"] = True
+        _runtime_state["error"] = ""
+
+    try:
+        world_map = load_or_build_default_map()
+        if not world_map.actors:
+            world_map.actors = _default_actors()
+
+        engine = initialize_engine(
+            world_map,
+            tick_rate=float(os.getenv("TICK_RATE", "2.0")),
+            enable_ai=_env_bool("ENABLE_AI", True),
+            ollama_model=os.getenv("LLM_MODEL", "ollama/llama3.2"),
+            ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
+        )
+
+        # Warm up: one initial plan per actor so simulation starts with intent.
+        if engine.enable_ai:
+            for actor in world_map.actors:
+                brain = engine.agent_brains.get(actor.id)
+                if not brain:
+                    continue
+                plan, thought_summary = brain.create_plan()
+                actor.action_queue = plan
+                actor.needs_replan = False
+                actor.interrupt_reason = ""
+                engine._log_event(
+                    actor_id=actor.id,
+                    event_type="plan",
+                    description=thought_summary,
+                    data={"steps": len(plan), "initial": True},
+                )
+
+        with _runtime_lock:
+            _runtime_state["world_map"] = world_map
+            _runtime_state["engine"] = engine
+            _runtime_state["ready"] = True
+            _runtime_state["generating"] = False
+            _runtime_state["error"] = ""
+    except Exception as exc:  # noqa: BLE001
+        with _runtime_lock:
+            _runtime_state["ready"] = False
+            _runtime_state["generating"] = False
+            _runtime_state["error"] = str(exc)
+
+
 def advance_tick() -> None:
     """Advance the simulation by one tick (used by the UI button and auto-loop)."""
+    with _runtime_lock:
+        engine = _runtime_state["engine"]
+    if engine is None:
+        return
     engine.tick()
 
 
 def _tick_loop() -> None:
     """Background thread: advances the simulation at the configured tick rate."""
     while True:
+        with _runtime_lock:
+            engine = _runtime_state["engine"]
+            ready = bool(_runtime_state["ready"])
         try:
-            advance_tick()
+            if ready and engine is not None:
+                engine.tick()
         except Exception:  # noqa: BLE001 — keep the loop alive on errors
             pass
-        time.sleep(engine.tick_rate)
+        time.sleep(engine.tick_rate if engine is not None else 0.5)
 
 
 if not manual_tick:
@@ -90,17 +196,42 @@ def get_world_snapshot() -> dict:
 
     Reads state only — ticking happens on the background thread.
     """
+    with _runtime_lock:
+        world_map = _runtime_state["world_map"]
+        engine = _runtime_state["engine"]
+        ready = bool(_runtime_state["ready"])
+        generating = bool(_runtime_state["generating"])
+        error = str(_runtime_state["error"])
+
+    if not ready or world_map is None or engine is None:
+        return {
+            "ready": False,
+            "generating": generating,
+            "error": error,
+            "tick": 0,
+            "elapsed_time": 0.0,
+            "elapsed_time_formatted": "00:00",
+            "width": 0,
+            "height": 0,
+            "tiles": [],
+            "ascii": "",
+            "actors": [],
+            "recent_events": [],
+            "llm_calls": 0,
+            "llm_pending_actors": [],
+        }
+
     # Compute physics data for each actor.
     actor_data = []
-    for actor in DEFAULT_MARKET.actors:
-        viewport = get_visible_tiles_and_actors(DEFAULT_MARKET, actor, vision_range=10)
+    for actor in world_map.actors:
+        viewport = get_visible_tiles_and_actors(world_map, actor, vision_range=10)
         
         # Find path to a target for demo (e.g., first visible actor).
         path = None
         if viewport.visible_actors:
             target = viewport.visible_actors[0]
             path = breadth_first_search(
-                DEFAULT_MARKET,
+                world_map,
                 actor.x,
                 actor.y,
                 target.x,
@@ -125,10 +256,13 @@ def get_world_snapshot() -> dict:
     
     return {
         "tick": engine.tick_count,
+        "ready": True,
+        "generating": False,
+        "error": "",
         "elapsed_time": engine.get_elapsed_time(),
         "elapsed_time_formatted": engine.get_elapsed_time_formatted(),
-        "width": DEFAULT_MARKET.width,
-        "height": DEFAULT_MARKET.height,
+        "width": world_map.width,
+        "height": world_map.height,
         "tiles": [
             {
                 "x": tile.x,
@@ -138,9 +272,9 @@ def get_world_snapshot() -> dict:
                 "interactable": tile.interactable,
                 "symbol": tile.symbol,
             }
-            for tile in DEFAULT_MARKET.tiles
+            for tile in world_map.tiles
         ],
-        "ascii": render_ascii(DEFAULT_MARKET, show_actors=True),
+        "ascii": render_ascii(world_map, show_actors=True),
         "actors": actor_data,
         "recent_events": engine.get_event_log(limit=200),
         "llm_calls": engine.llm_call_count,
@@ -148,7 +282,14 @@ def get_world_snapshot() -> dict:
     }
 
 
-register_pages(get_world_snapshot, advance_tick=advance_tick, manual_tick=manual_tick)
+register_pages(
+    get_world_snapshot,
+    advance_tick=advance_tick,
+    manual_tick=manual_tick,
+    is_world_ready=is_world_ready,
+    start_generation=generate_world,
+    get_generation_status=get_generation_status,
+)
 ui.run_with(app, storage_secret="ai-market-sim-dev-secret")
 
 

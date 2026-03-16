@@ -11,7 +11,7 @@ Phase 3: AI agents control all actor behavior via LLM reasoning.
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TYPE_CHECKING
@@ -63,6 +63,9 @@ class SimulationEngine:
 		self.enable_ai = enable_ai
 		self.llm_call_count: int = 0  # total LLM planning calls made
 		self.llm_pending_actors: list[str] = []  # actor names currently waiting on LLM
+		self._plan_executor = ThreadPoolExecutor(max_workers=max(1, len(self.world_map.actors)))
+		self._pending_plan_futures: dict[str, Future] = {}
+		self._pending_plan_started_tick: dict[str, int] = {}
 		
 		# Initialize AI brains for each actor
 		self.agent_brains: dict[str, AgentBrain] = {}
@@ -111,6 +114,67 @@ class SimulationEngine:
 		)
 		self.events.append(event)
 
+	def _actor_by_id(self, actor_id: str) -> Actor | None:
+		"""Find an actor by id from the current world state."""
+		return next((a for a in self.world_map.actors if a.id == actor_id), None)
+
+	def _submit_plan_request(self, actor: Actor, brain: AgentBrain) -> None:
+		"""Submit a non-blocking LLM planning request for one actor."""
+		if actor.id in self._pending_plan_futures:
+			return
+		interrupt_reason = actor.interrupt_reason
+		future = self._plan_executor.submit(brain.create_plan, interrupt_reason)
+		self._pending_plan_futures[actor.id] = future
+		self._pending_plan_started_tick[actor.id] = self.tick_count
+		self.llm_call_count += 1
+		self._log_event(
+			actor_id=actor.id,
+			event_type="plan_submitted",
+			description=f"{actor.name} requested a new plan",
+			data={"interrupt_reason": interrupt_reason},
+		)
+
+	def _collect_completed_plan_requests(self, updates: dict) -> None:
+		"""Apply completed planning jobs without blocking the current tick."""
+		for actor_id, future in list(self._pending_plan_futures.items()):
+			if not future.done():
+				continue
+
+			actor = self._actor_by_id(actor_id)
+			if actor is None:
+				self._pending_plan_futures.pop(actor_id, None)
+				self._pending_plan_started_tick.pop(actor_id, None)
+				continue
+
+			try:
+				plan, thought_summary = future.result()
+				actor.action_queue = plan
+				actor.needs_replan = False
+				actor.interrupt_reason = ""
+				self._log_event(
+					actor_id=actor.id,
+					event_type="plan",
+					description=thought_summary,
+					data={"steps": len(plan)},
+				)
+				updates["actor_actions"].append({
+					"actor_id": actor.id,
+					"actor_name": actor.name,
+					"summary": thought_summary,
+				})
+			except Exception as e:
+				self._log_event(
+					actor_id=actor.id,
+					event_type="error",
+					description=f"{actor.name} failed to plan: {e}",
+					data={"error": str(e)},
+				)
+				actor.action_queue = []
+				actor.needs_replan = True
+
+			self._pending_plan_futures.pop(actor_id, None)
+			self._pending_plan_started_tick.pop(actor_id, None)
+
 	def tick(self) -> dict:
 		"""Execute one simulation tick.
 
@@ -125,61 +189,29 @@ class SimulationEngine:
 		}
 
 		if self.enable_ai:
-			# Split actors into those needing a new plan vs those executing existing steps
-			needs_plan: list = []  # (actor, brain)
-			has_steps: list = []   # actor
+			# Apply any plan jobs that completed since previous tick(s), without blocking.
+			self._collect_completed_plan_requests(updates)
 
+			# Submit new plan requests for actors that need planning and have no pending job.
 			for actor in self.world_map.actors:
 				brain = self.agent_brains.get(actor.id)
 				if not brain:
 					continue
-				if actor.needs_replan or not actor.action_queue:
-					needs_plan.append((actor, brain))
-				else:
-					has_steps.append(actor)
+				needs_plan = actor.needs_replan or not actor.action_queue
+				if needs_plan and actor.id not in self._pending_plan_futures:
+					self._submit_plan_request(actor, brain)
 
-			# —— Fire all planning calls in parallel ——
-			if needs_plan:
-				self.llm_call_count += len(needs_plan)
-				self.llm_pending_actors = [a.name for a, _ in needs_plan]
+			# Keep UI status in sync with currently pending planning jobs.
+			self.llm_pending_actors = [
+				a.name
+				for a in self.world_map.actors
+				if a.id in self._pending_plan_futures
+			]
 
-				def _plan_actor(actor_brain_pair):
-					actor, brain = actor_brain_pair
-					return actor, brain.create_plan(interrupt_reason=actor.interrupt_reason)
-
-				with ThreadPoolExecutor(max_workers=len(needs_plan)) as pool:
-					futures = {pool.submit(_plan_actor, pair): pair[0] for pair in needs_plan}
-					for future in as_completed(futures):
-						actor = futures[future]
-						try:
-							actor, (plan, thought_summary) = future.result()
-							actor.action_queue = plan
-							actor.needs_replan = False
-							actor.interrupt_reason = ""
-							self._log_event(
-								actor_id=actor.id,
-								event_type="plan",
-								description=thought_summary,
-								data={"steps": len(plan)},
-							)
-							updates["actor_actions"].append({
-								"actor_id": actor.id,
-								"actor_name": actor.name,
-								"summary": thought_summary,
-							})
-						except Exception as e:
-							self._log_event(
-								actor_id=actor.id,
-								event_type="error",
-								description=f"{actor.name} failed to plan: {e}",
-								data={"error": str(e)},
-							)
-							actor.action_queue = []
-
-				self.llm_pending_actors = []
-
-			# —— Execute one step for actors with existing plans (sequential, mutates state) ——
-			for actor in has_steps:
+			# Execute one step for actors with existing plans (sequential, mutates state).
+			for actor in self.world_map.actors:
+				if not actor.action_queue:
+					continue
 				action = actor.action_queue.pop(0)
 				result = self._execute_action(actor, action)
 				updates["actor_actions"].append({
@@ -210,6 +242,10 @@ class SimulationEngine:
 		"""
 		actor = next((a for a in self.world_map.actors if a.id == actor_id), None)
 		if actor:
+			pending = self._pending_plan_futures.pop(actor_id, None)
+			if pending is not None and not pending.done():
+				pending.cancel()
+			self._pending_plan_started_tick.pop(actor_id, None)
 			actor.needs_replan = True
 			actor.interrupt_reason = reason
 			actor.action_queue = []

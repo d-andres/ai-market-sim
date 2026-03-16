@@ -9,6 +9,23 @@ Keep the world running at a fixed tick rate while LLM planning is in flight, and
 - Add reflex behavior when no plan is ready.
 - Reduce unnecessary LLM calls (strategic check-ins rather than per-step thinking).
 - Keep existing trade/conversation systems compatible.
+- Add initialization gate: explicit map generation/loading before world becomes live.
+
+## Initialization Gate (Implemented)
+
+### Behavior
+- Frontend initially shows a `GENERATE MAP` action when no live world is ready.
+- After selection, backend enters loading mode:
+   - map is created/loaded,
+   - actors are populated,
+   - engine is initialized,
+   - each actor gets one initial LLM plan.
+- Only after this completes does frontend transition to map view and live ticking.
+
+### Why
+- Prevents partially initialized UI state.
+- Makes startup deterministic and user-controlled.
+- Avoids ticking against an uninitialized map/engine.
 
 ## Safety and Extensibility Constraints
 - Prefer additive changes and preserve existing action contracts (`move`, `wait`, `propose_trade`, `converse`).

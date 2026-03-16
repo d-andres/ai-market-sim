@@ -32,12 +32,65 @@ _PAGE_CSS = """
 """
 
 
-def register_pages(get_world_snapshot: Callable[[], dict], advance_tick: Callable[[], None] | None = None, manual_tick: bool = False) -> None:
+def register_pages(
+	get_world_snapshot: Callable[[], dict],
+	advance_tick: Callable[[], None] | None = None,
+	manual_tick: bool = False,
+	is_world_ready: Callable[[], bool] | None = None,
+	start_generation: Callable[[], None] | None = None,
+	get_generation_status: Callable[[], dict] | None = None,
+) -> None:
 	"""Register NiceGUI pages for the application."""
 
 	@ui.page("/")
 	def dashboard(request: Request) -> None:
 		ui.add_head_html(_PAGE_CSS)
+
+		if is_world_ready is not None and not is_world_ready():
+			status = get_generation_status() if get_generation_status is not None else {
+				"ready": False,
+				"generating": False,
+				"error": "",
+			}
+
+			ui.label("⚔  AI MARKET SIM  ⚔").style(
+				"font-family:'VT323',monospace;font-size:2.6rem;color:#d4a017;letter-spacing:0.15em;"
+			)
+			with ui.card().classes("w-full max-w-2xl"):
+				ui.label("WORLD INITIALIZATION").style(
+					"font-family:'VT323',monospace;font-size:1.6rem;color:#d4a017;letter-spacing:0.1em"
+				)
+				status_label = ui.label("").style(
+					"font-family:'VT323',monospace;font-size:1.1rem;color:#7a7a7a;"
+				)
+				error_label = ui.label("").style(
+					"font-family:'VT323',monospace;font-size:1rem;color:#ff6666;"
+				)
+
+				def _start_generate() -> None:
+					if start_generation is not None:
+						start_generation()
+
+				if not status.get("generating") and not status.get("ready") and start_generation is not None:
+					ui.button("GENERATE MAP", on_click=_start_generate).style(
+						"font-family:'VT323',monospace;font-size:1.2rem;background:#0d200d;color:#4caf50;border:1px solid #2d6a2d;"
+					)
+
+				def _refresh_generation_status() -> None:
+					latest = get_generation_status() if get_generation_status is not None else status
+					if latest.get("ready"):
+						ui.run_javascript("window.location.reload()")
+						return
+					if latest.get("generating"):
+						status_label.set_text("Loading... generating map, populating actors, and requesting initial plans.")
+					else:
+						status_label.set_text("World not initialized. Click GENERATE MAP to begin.")
+					error_label.set_text(latest.get("error") or "")
+
+				_refresh_generation_status()
+				ui.timer(1.0, _refresh_generation_status)
+
+			return
 
 		ui.label("⚔  AI MARKET SIM  ⚔").style(
 			"font-family:'VT323',monospace;font-size:2.6rem;color:#d4a017;letter-spacing:0.15em;"
