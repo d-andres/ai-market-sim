@@ -19,7 +19,7 @@ from smolagents import Tool, LiteLLMModel, ChatMessage, MessageRole
 
 from src.models.schema import Actor, Map, PlannedAction, TradeProposal
 from src.simulation import physics
-from src.agents.prompts import TRADE_EVALUATION_PROMPT, get_system_prompt_for_role
+from src.agents.prompts import TRADE_EVALUATION_PROMPT, CONVERSATION_PROMPT, CONVERSATION_RANGE, get_system_prompt_for_role
 from src.agents.response_parser import parse_plan, parse_trade_decision
 
 if TYPE_CHECKING:
@@ -122,11 +122,19 @@ class ObserveSurroundingsTool(Tool):
 					", ".join(f"{i.name} (base {i.base_price}g) x{i.quantity}" for i in other.inventory)
 					if other.inventory else "nothing visible"
 				)
+				# Compute explicit move direction so the LLM never has to guess
+				dx = other.x - self.actor.x
+				dy = other.y - self.actor.y
+				v = ("south" if dy > 0 else "north" if dy < 0 else "")
+				h = ("east"  if dx > 0 else "west"  if dx < 0 else "")
+				direction_hint = (f"{v}{h}" if v and h else v or h or "here")
 				lines.append(
-					f"  - {other.name} [{other.role.value}] at ({other.x},{other.y}), "
-					f"dist {dist}, gold {other.gold}g | carrying: {inv_str}"
+					f"  - {other.name} (id: {other.id}) [{other.role.value}] at ({other.x},{other.y}), "
+					f"dist {dist}, direction: {direction_hint}"
+					+ (" [TRADE RANGE — use propose_trade]" if dist <= 2 else "")
+					+ (" [CONVERSATION RANGE — can use converse]" if dist <= CONVERSATION_RANGE else "")
+					+ f", gold {other.gold}g | carrying: {inv_str}"
 				)
-				# Surface relationship history so the LLM can use it
 				history = self.memory.summary_for(other.id, other.name)
 				lines.append(f"    History: {history}")
 		else:
@@ -207,15 +215,19 @@ class AgentBrain:
 			f"WORLD OBSERVATION:\n{observation}"
 			f"{interrupt_ctx}\n\n"
 			f"Create a plan of up to {self.PLAN_HORIZON} steps.\n"
+			"MOVEMENT REMINDER: y increases southward. To move toward a higher y, go south. To move toward a lower y, go north. To move toward a higher x, go east. To move toward a lower x, go west.\n"
+			"TRADE REMINDER: if an actor is marked [TRADE RANGE], do NOT move — use propose_trade immediately.\n"
+			"CONVERSE REMINDER: if an actor is marked [CONVERSATION RANGE], you may use converse to talk with them — useful for building relationships, gathering information, or roleplay.\n"
 			"Return ONLY a valid JSON object with exactly two keys:\n"
 			'  "summary": a single sentence (15-25 words) written in third person describing '
 			"your character's thoughts and intended actions in their own voice and personality.\n"
 			'  "plan": a JSON array where each element is one of these shapes:\n'
 			'    {"action_type": "move", "params": {"direction": "north"}, "reason": ""}\n'
 			'    {"action_type": "wait", "params": {}, "reason": ""}\n'
-			'    {"action_type": "propose_trade", "params": {"target_actor_id": "actor_id", '
+			'    {"action_type": "propose_trade", "params": {"target_actor_id": "<use the id field from observation>", '
 			'"offered_gold": 50, "offered_item_ids": "", "requested_item_ids": "item_crown", '
 			'"requested_gold": 0}, "reason": ""}\n'
+			'    {"action_type": "converse", "params": {"target_actor_id": "<use the id field from observation>", "opening_line": "What do you sell here?"}, "reason": ""}\n'
 			"Valid directions: north, south, east, west, northeast, northwest, southeast, southwest.\n"
 			"No prose outside the JSON. No markdown. Only the JSON object."
 		)
@@ -284,6 +296,49 @@ class AgentBrain:
 			return False, f"{self.actor.name} couldn't process the offer right now."
 
 		return parse_trade_decision(raw, self.actor.name)
+
+	def conduct_conversation(
+		self,
+		listener: Actor,
+		opening_line: str,
+	) -> tuple[str, str]:
+		"""Respond in-character to a conversation opener from another actor.
+
+		Returns (spoken_reply, private_impression) both as plain strings.
+		"""
+		relationship = self.memory.summary_for(listener.id, listener.name)
+		prompt = CONVERSATION_PROMPT.format(
+			speaker_name=self.actor.name,
+			speaker_role=self.actor.role.value,
+			listener_name=listener.name,
+			listener_role=listener.role.value,
+			relationship_history=relationship,
+			opening_line=opening_line,
+		)
+		try:
+			response = self.model([
+				ChatMessage(role=MessageRole.SYSTEM, content=[{"type": "text", "text": self.system_prompt}]),
+				ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": prompt}]),
+			])
+			raw: str = response.content if hasattr(response, "content") else str(response)
+		except Exception:
+			return f"{self.actor.name} says nothing.", "No impression formed."
+		return _parse_conversation_response(raw, self.actor.name)
+
+def _parse_conversation_response(raw: str, actor_name: str) -> tuple[str, str]:
+	"""Extract SAY/IMPRESSION lines from a conversation LLM response."""
+	from src.agents.response_parser import clean
+	content = clean(raw)
+	spoken = f"{actor_name} nods silently."
+	impression = "No strong impression."
+	for line in content.splitlines():
+		line = line.strip()
+		upper = line.upper()
+		if upper.startswith("SAY:"):
+			spoken = line.split(":", 1)[1].strip()
+		elif upper.startswith("IMPRESSION:"):
+			impression = line.split(":", 1)[1].strip()
+	return spoken, impression
 
 
 def create_agent_for_actor(

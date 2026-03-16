@@ -25,12 +25,12 @@ def _map_to_html(ascii_map: str) -> str:
             escaped = ch.replace("&", "&amp;").replace("<", "&lt;")
             parts.append(f'<span style="color:{colour}">{escaped}</span>')
         lines.append("".join(parts))
-    inner = "<br>".join(lines)
+    inner = "\n".join(lines)
     return (
         '<pre style="'
         "background:#000;margin:0;padding:1rem 1.5rem;"
-        "font-family:'VT323',monospace;font-size:1.25rem;line-height:1.2;"
-        'letter-spacing:0.05em;display:inline-block;">'
+        "font-family:'VT323',monospace;font-size:1.25rem;line-height:1.0;"
+        'letter-spacing:0.15em;display:inline-block;">'
         f"{inner}</pre>"
     )
 

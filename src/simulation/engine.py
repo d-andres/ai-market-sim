@@ -236,15 +236,20 @@ class SimulationEngine:
 			new_x, new_y = actor.x + dx, actor.y + dy
 			if not physics.can_move_to(self.world_map, new_x, new_y, exclude_actor_id=actor.id):
 				blocking = physics.get_blocking_actor(self.world_map, new_x, new_y)
-				reason = (
-					f"Path blocked by {blocking.name} at ({new_x},{new_y})"
-					if blocking else
-					f"Tile ({new_x},{new_y}) is not walkable"
-				)
-				self.interrupt_actor(actor.id, reason)
-				# Also interrupt the blocker so they react
 				if blocking:
+					# Already adjacent — skip the move step, don't wipe plans
+					current_dist = physics.distance_chebyshev(actor.x, actor.y, blocking.x, blocking.y)
+					if current_dist <= 2:
+						desc = f"{actor.name} is adjacent to {blocking.name} and ready to trade"
+						self._log_event(actor.id, "wait", desc)
+						return desc
+					# Far away — real block, interrupt both
+					reason = f"Path blocked by {blocking.name} at ({new_x},{new_y})"
+					self.interrupt_actor(actor.id, reason)
 					self.interrupt_actor(blocking.id, f"{actor.name} tried to move into your tile")
+					return reason
+				reason = f"Tile ({new_x},{new_y}) is not walkable"
+				self.interrupt_actor(actor.id, reason)
 				return reason
 			old_x, old_y = actor.x, actor.y
 			actor.x, actor.y = new_x, new_y
@@ -260,13 +265,87 @@ class SimulationEngine:
 		elif action.action_type == "propose_trade":
 			return self._execute_trade_action(actor, action.params)
 
+		elif action.action_type == "converse":
+			return self._execute_converse_action(actor, action.params)
+
 		else:
 			return f"Unknown action type: '{action.action_type}'"
+
+	def _resolve_actor(self, target_id: str) -> Actor | None:
+		"""Find an actor by id, falling back to case-insensitive name match."""
+		by_id = next((a for a in self.world_map.actors if a.id == target_id), None)
+		if by_id:
+			return by_id
+		lower = target_id.lower()
+		return next((a for a in self.world_map.actors if a.name.lower() == lower), None)
+
+	def _execute_converse_action(self, actor: Actor, params: dict) -> str:
+		"""Execute a converse action: initiator speaks, listener replies, both record memory."""
+		from src.agents.prompts import CONVERSATION_RANGE
+		target_id = params.get("target_actor_id", "")
+		target = self._resolve_actor(target_id)
+		if target is None:
+			return f"{actor.name} tries to speak but finds no one called '{target_id}'."
+
+		dist = physics.distance_chebyshev(actor.x, actor.y, target.x, target.y)
+		if dist > CONVERSATION_RANGE:
+			reason = f"{target.name} is {dist} tiles away — too far to converse"
+			self.interrupt_actor(actor.id, reason)
+			return reason
+
+		opening_line = params.get("opening_line", "Hello.").strip() or "Hello."
+
+		# Listener's brain generates a reply and a private impression
+		listener_brain = self.agent_brains.get(target.id)
+		if listener_brain:
+			reply, listener_impression = listener_brain.conduct_conversation(actor, opening_line)
+		else:
+			reply = "*nods but says nothing*"
+			listener_impression = "No impression formed."
+
+		# Log two separate events so they appear as distinct lines in the event log
+		self._log_event(
+			actor.id, "converse",
+			f'{actor.name} says to {target.name}: "{opening_line}"',
+			{"target_id": target_id, "line": opening_line},
+		)
+		self._log_event(
+			target.id, "converse",
+			f'{target.name} replies to {actor.name}: "{reply}"',
+			{"target_id": actor.id, "line": reply},
+		)
+
+		# Both actors record the exchange in their relationship memory
+		initiator_brain = self.agent_brains.get(actor.id)
+		if initiator_brain:
+			initiator_brain.memory.record(
+				tick=self.tick_count,
+				actor_id=target.id,
+				event_type="converse",
+				notes=f"I said: \"{opening_line}\" — they replied: \"{reply}\"",
+			)
+		if listener_brain:
+			listener_brain.memory.record(
+				tick=self.tick_count,
+				actor_id=actor.id,
+				event_type="converse",
+				notes=f"{actor.name} said: \"{opening_line}\" — I replied: \"{reply}\". My impression: {listener_impression}",
+			)
+			# Soft interrupt: listener replans next tick knowing they were just addressed
+			# Only interrupt if they don't already have a converse or trade step queued
+			next_action = target.action_queue[0].action_type if target.action_queue else None
+			if next_action not in ("converse", "propose_trade"):
+				self.interrupt_actor(
+					target.id,
+					f"{actor.name} just spoke to you: \"{opening_line}\" — you replied: \"{reply}\". You may respond further or continue what you were doing.",
+				)
+
+		return f'{actor.name} → {target.name}: "{opening_line}" | {target.name}: "{reply}"'
 
 	def _execute_trade_action(self, actor: Actor, params: dict) -> str:
 		"""Execute a propose_trade action step."""
 		target_id = params.get("target_actor_id", "")
-		target = next((a for a in self.world_map.actors if a.id == target_id), None)
+		target = self._resolve_actor(target_id)
 		if target is None:
 			reason = f"Trade target '{target_id}' not found"
 			self.interrupt_actor(actor.id, reason)
