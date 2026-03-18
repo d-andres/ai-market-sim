@@ -15,7 +15,7 @@ from nicegui import ui
 
 from data import load_or_build_default_map, render_ascii
 from src.ui import register_pages
-from src.models.schema import Actor, ActorRole
+from src.models.schema import Actor, ActorRole, Item, WorldItem
 from src.simulation.physics import get_visible_tiles_and_actors, breadth_first_search
 from src.simulation.engine import initialize_engine
 
@@ -61,10 +61,43 @@ _runtime_state = {
     "error": "",
     "initial_plan_expected": 0,
     "initial_plan_completed": 0,
+    "paused": True,
 }
 
 
-manual_tick = _env_bool("MANUAL_TICK", False)
+def _populate_default_items(world_map) -> None:
+    """Place default items on shop shelves owned by the shopkeeper."""
+    shopkeeper = next(
+        (a for a in world_map.actors if a.role == ActorRole.SHOPKEEPER), None
+    )
+    owner_id = shopkeeper.id if shopkeeper else None
+
+    shop_tiles = [(t.x, t.y) for t in world_map.tiles if t.tile_type.value == "shop"]
+    if not shop_tiles:
+        return
+
+    catalog = [
+        Item(id="potion_health",  name="Health Potion",  description="Restores 20 HP.",                    base_price=10, quantity=3),
+        Item(id="potion_mana",    name="Mana Potion",    description="Restores magical energy.",            base_price=8,  quantity=2),
+        Item(id="sword_short",    name="Short Sword",    description="A dependable one-handed blade.",      base_price=50, quantity=2),
+        Item(id="dagger",         name="Iron Dagger",    description="Small, fast, concealable.",           base_price=20, quantity=3),
+        Item(id="armor_leather",  name="Leather Armor",  description="Lightweight protective vest.",        base_price=35, quantity=2),
+        Item(id="shield_wooden",  name="Wooden Shield",  description="Offers modest protection.",           base_price=15, quantity=2),
+        Item(id="food_bread",     name="Bread Loaf",     description="Fills the belly.",                    base_price=3,  quantity=5),
+        Item(id="food_cheese",    name="Hard Cheese",    description="Aged and pungent.",                   base_price=4,  quantity=4),
+        Item(id="trinket_ring",   name="Gold Ring",      description="A simple but fine ring.",             base_price=20, quantity=1),
+        Item(id="trinket_gem",    name="Amethyst Gem",   description="Deep purple, catches the light.",     base_price=40, quantity=1),
+        Item(id="rope",           name="Hemp Rope",      description="10 metres of sturdy rope.",           base_price=5,  quantity=3),
+        Item(id="torch",          name="Torch",          description="Burns for several hours.",            base_price=2,  quantity=8),
+    ]
+
+    for i, item in enumerate(catalog):
+        if i >= len(shop_tiles):
+            break
+        tx, ty = shop_tiles[i]
+        world_map.world_items.append(
+            WorldItem(item=item, x=tx, y=ty, owner_id=owner_id)
+        )
 
 
 def _default_actors() -> list[Actor]:
@@ -133,6 +166,7 @@ def generate_world() -> None:
         world_map = load_or_build_default_map()
         if not world_map.actors:
             world_map.actors = _default_actors()
+        _populate_default_items(world_map)
 
         engine = initialize_engine(
             world_map,
@@ -204,17 +238,29 @@ def _tick_loop() -> None:
         with _runtime_lock:
             engine = _runtime_state["engine"]
             ready = bool(_runtime_state["ready"])
+            paused = bool(_runtime_state["paused"])
         try:
-            if ready and engine is not None:
+            if ready and engine is not None and not paused:
                 engine.tick()
         except Exception:  # noqa: BLE001 — keep the loop alive on errors
             pass
         time.sleep(engine.tick_rate if engine is not None else 0.5)
 
 
-if not manual_tick:
-    _ticker = threading.Thread(target=_tick_loop, daemon=True)
-    _ticker.start()
+_ticker = threading.Thread(target=_tick_loop, daemon=True)
+_ticker.start()
+
+
+def is_paused() -> bool:
+    """Return True when the simulation is paused."""
+    with _runtime_lock:
+        return bool(_runtime_state["paused"])
+
+
+def set_paused(paused: bool) -> None:
+    """Pause or resume the simulation tick loop."""
+    with _runtime_lock:
+        _runtime_state["paused"] = paused
 
 
 def get_world_snapshot() -> dict:
@@ -302,6 +348,20 @@ def get_world_snapshot() -> dict:
         ],
         "ascii": render_ascii(world_map, show_actors=True),
         "actors": actor_data,
+        "world_items": [
+            {
+                "item_id": gi.item.id,
+                "item_name": gi.item.name,
+                "item_description": gi.item.description,
+                "quantity": gi.item.quantity,
+                "base_price": gi.item.base_price,
+                "x": gi.x,
+                "y": gi.y,
+                "owner_id": gi.owner_id,
+                "is_shelf": world_map.tile_at(gi.x, gi.y).tile_type.value == "shop",
+            }
+            for gi in world_map.world_items
+        ],
         "recent_events": engine.get_event_log(limit=200),
         "llm_calls": engine.llm_call_count,
         "llm_pending_actors": list(engine.llm_pending_actors),
@@ -310,8 +370,8 @@ def get_world_snapshot() -> dict:
 
 register_pages(
     get_world_snapshot,
-    advance_tick=advance_tick,
-    manual_tick=manual_tick,
+    is_paused=is_paused,
+    set_paused=set_paused,
     is_world_ready=is_world_ready,
     start_generation=start_generation,
     get_generation_status=get_generation_status,

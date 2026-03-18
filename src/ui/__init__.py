@@ -1,6 +1,5 @@
 """NiceGUI user interface components and page registration."""
 
-import asyncio
 from collections.abc import Callable
 import json
 
@@ -34,8 +33,8 @@ _PAGE_CSS = """
 
 def register_pages(
 	get_world_snapshot: Callable[[], dict],
-	advance_tick: Callable[[], None] | None = None,
-	manual_tick: bool = False,
+	is_paused: Callable[[], bool] | None = None,
+	set_paused: Callable[[bool], None] | None = None,
 	is_world_ready: Callable[[], bool] | None = None,
 	start_generation: Callable[[], None] | None = None,
 	get_generation_status: Callable[[], dict] | None = None,
@@ -128,23 +127,17 @@ def register_pages(
 
 		world_state = get_world_snapshot()
 
-		# ── Tick control coroutine (defined early so button lambda can reference it) ──
-		tick_running = {"value": False}
+		# ── Play / Pause toggle ────────────────────────────────────────────────
+		_play_btn: dict = {"el": None}
 
-		if manual_tick and advance_tick is not None:
-			async def next_tick() -> None:
-				if tick_running["value"]:
-					return
-				tick_running["value"] = True
-				status_label.set_text("⏳ Agents thinking...")
-				try:
-					loop = asyncio.get_event_loop()
-					await loop.run_in_executor(None, advance_tick)
-					status_label.set_text("✓ Tick complete")
-				except Exception as exc:
-					status_label.set_text(f"✗ Error: {exc}")
-				finally:
-					tick_running["value"] = False
+		def _toggle_pause() -> None:
+			if is_paused is None or set_paused is None:
+				return
+			new_paused = not is_paused()
+			set_paused(new_paused)
+			btn = _play_btn["el"]
+			if btn is not None:
+				btn.set_text("▶ PLAY" if new_paused else "⏸ PAUSE")
 
 		# ── Controls + status bar (above the map) ──────────────────────────────
 		with ui.card().classes("w-full"):
@@ -158,11 +151,15 @@ def register_pages(
 				thinking_label = ui.label("").style(
 					"font-family:'VT323',monospace;font-size:1rem;color:#00bcd4;background:#001a1f;padding:2px 10px;border-radius:3px;border:1px solid #004d5a"
 				)
-				status_label = ui.label("READY").style(
+				status_label = ui.label("PAUSED").style(
 					"font-family:'VT323',monospace;font-size:1rem;color:#4caf50;letter-spacing:0.05em"
 				)
-				if manual_tick and advance_tick is not None:
-					ui.button("▶ NEXT TICK", on_click=next_tick).style(
+				if is_paused is not None and set_paused is not None:
+					_initial_paused = is_paused()
+					_play_btn["el"] = ui.button(
+						"▶ PLAY" if _initial_paused else "⏸ PAUSE",
+						on_click=_toggle_pause,
+					).style(
 						"font-family:'VT323',monospace;font-size:1.1rem;background:#0d200d;color:#4caf50;border:1px solid #2d6a2d;"
 					)
 
@@ -197,13 +194,16 @@ def register_pages(
 				names = ", ".join(pending)
 				thinking_label.set_text(f"🧠 {names}...")
 				thinking_label.set_visibility(True)
-				if not tick_running.get("value"):
-					status_label.set_text("⏳ THINKING...")
+				status_label.set_text("⏳ THINKING...")
 			else:
 				thinking_label.set_text("")
 				thinking_label.set_visibility(False)
-				if not tick_running.get("value"):
-					status_label.set_text("✓ UPDATED")
+				paused = is_paused() if is_paused is not None else True
+				status_label.set_text("PAUSED" if paused else "✓ UPDATED")
+			# Keep play/pause button label in sync
+			btn = _play_btn["el"]
+			if btn is not None and is_paused is not None:
+				btn.set_text("▶ PLAY" if is_paused() else "⏸ PAUSE")
 			# Push only new events — ui.log auto-scrolls to the bottom
 			events = snapshot.get("recent_events", [])
 			for e in events[last_event_count["n"]:]:

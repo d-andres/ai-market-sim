@@ -79,6 +79,7 @@ Status: COMPLETED
 - Event log shows stale plan discard/debug events for traceability.
 
 ## Phase 3: Reflex Layer (No LLM Required)
+Status: COMPLETED
 
 ### Changes
 1. Add engine reflex handler for actors with empty queue + pending plan:
@@ -104,6 +105,7 @@ Target structure for maintainable growth of actions:
 4. Keep parser/prompts aligned by documenting new action schemas in one place.
 
 ## Phase 4: Replan Cadence and Load Shedding
+Status: COMPLETED
 
 ### Changes
 1. Add strategic replan cadence (periodic check-ins) instead of per-step calls.
@@ -119,6 +121,7 @@ Target structure for maintainable growth of actions:
 - High-priority actors/events receive planning first.
 
 ## Phase 5: Conversation Latency Optimization
+Status: COMPLETED
 
 ### Changes
 1. Keep current converse action path.

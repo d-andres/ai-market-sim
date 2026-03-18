@@ -19,7 +19,7 @@ from smolagents import Tool, LiteLLMModel, ChatMessage, MessageRole
 
 from src.models.schema import Actor, Map, PlannedAction, TradeProposal
 from src.simulation import physics
-from src.agents.prompts import TRADE_EVALUATION_PROMPT, CONVERSATION_PROMPT, CONVERSATION_RANGE, get_system_prompt_for_role
+from src.agents.prompts import TRADE_EVALUATION_PROMPT, CONVERSATION_RANGE, get_system_prompt_for_role
 from src.agents.response_parser import parse_plan, parse_trade_decision
 
 if TYPE_CHECKING:
@@ -118,9 +118,13 @@ class ObserveSurroundingsTool(Tool):
 				dist = physics.distance_chebyshev(
 					self.actor.x, self.actor.y, other.x, other.y
 				)
+				# Effective inventory = carried + shelf items owned by this actor
+				eff_items = list(other.inventory) + [
+					gi.item for gi in self.world_map.world_items if gi.owner_id == other.id
+				]
 				inv_str = (
-					", ".join(f"{i.name} (base {i.base_price}g) x{i.quantity}" for i in other.inventory)
-					if other.inventory else "nothing visible"
+					", ".join(f"{i.name} (id:{i.id}, base {i.base_price}g) x{i.quantity}" for i in eff_items)
+					if eff_items else "nothing visible"
 				)
 				# Compute explicit move direction so the LLM never has to guess
 				dx = other.x - self.actor.x
@@ -133,12 +137,32 @@ class ObserveSurroundingsTool(Tool):
 					f"dist {dist}, direction: {direction_hint}"
 					+ (" [TRADE RANGE — use propose_trade]" if dist <= 2 else "")
 					+ (" [CONVERSATION RANGE — can use converse]" if dist <= CONVERSATION_RANGE else "")
-					+ f", gold {other.gold}g | carrying: {inv_str}"
+					+ f", gold {other.gold}g | carrying/selling: {inv_str}"
 				)
 				history = self.memory.summary_for(other.id, other.name)
 				lines.append(f"    History: {history}")
 		else:
 			lines.append("\nNo other actors visible.")
+
+		# Unowned items on the ground (can be picked up)
+		visible_set = set(viewport.visible_tiles)
+		unowned_gis = [
+			gi for gi in self.world_map.world_items
+			if (gi.x, gi.y) in visible_set and gi.owner_id is None
+		]
+		if unowned_gis:
+			lines.append("\nItems on the ground (unowned — can use pick_up):")
+			by_pos: dict[tuple[int, int], list] = {}
+			for gi in unowned_gis:
+				by_pos.setdefault((gi.x, gi.y), []).append(gi)
+			for (gx, gy), gis in sorted(by_pos.items()):
+				dist = physics.distance_chebyshev(self.actor.x, self.actor.y, gx, gy)
+				item_strs = [
+					f"{gi.item.name} (id:{gi.item.id}) x{gi.item.quantity}"
+					for gi in gis
+				]
+				pickup_hint = " [PICK UP RANGE]" if dist <= 1 else ""
+				lines.append(f"  - ({gx},{gy}) dist {dist}{pickup_hint}: {', '.join(item_strs)}")
 
 		shop_coords = [
 			(x, y) for x, y in viewport.visible_tiles
@@ -225,10 +249,14 @@ class AgentBrain:
 			'    {"action_type": "move", "params": {"direction": "north"}, "reason": ""}\n'
 			'    {"action_type": "wait", "params": {}, "reason": ""}\n'
 			'    {"action_type": "propose_trade", "params": {"target_actor_id": "<use the id field from observation>", '
-			'"offered_gold": 50, "offered_item_ids": "", "requested_item_ids": "item_crown", '
+			'"offered_gold": 50, "offered_item_ids": "", "requested_item_ids": "<item id from their carrying/selling>", '
 			'"requested_gold": 0}, "reason": ""}\n'
 			'    {"action_type": "converse", "params": {"target_actor_id": "<use the id field from observation>", "opening_line": "What do you sell here?"}, "reason": ""}\n'
+			'    {"action_type": "pick_up", "params": {"item_id": "<id from items on ground list>"}, "reason": ""}\n'
+			'    {"action_type": "place", "params": {"item_id": "<id from your inventory>", "x": 5, "y": 3}, "reason": ""}\n'
 			"Valid directions: north, south, east, west, northeast, northwest, southeast, southwest.\n"
+			"TRADE NOTE: to buy a shopkeeper's shelf item, use propose_trade with the item id shown in their carrying/selling list.\n"
+			"PICK UP NOTE: use pick_up only for unowned floor items marked [PICK UP RANGE].\n"
 			"No prose outside the JSON. No markdown. Only the JSON object."
 		)
 
@@ -297,21 +325,26 @@ class AgentBrain:
 
 		return parse_trade_decision(raw, self.actor.name)
 
-	def conduct_conversation(
+	def conduct_conversation_packet(
 		self,
-		listener: Actor,
+		initiator: Actor,
 		opening_line: str,
-	) -> tuple[str, str]:
-		"""Respond in-character to a conversation opener from another actor.
+	) -> tuple[str, list[str], str, str]:
+		"""Respond in-character and return pre-planned follow-up lines in one LLM call.
 
-		Returns (spoken_reply, private_impression) both as plain strings.
+		Returns (reply, follow_ups, tone, impression).
+		- reply: immediate spoken response
+		- follow_ups: 0-2 pre-planned continuation lines for subsequent turns
+		- tone: single-word emotional tone descriptor
+		- impression: private assessment recorded in relationship memory
 		"""
-		relationship = self.memory.summary_for(listener.id, listener.name)
-		prompt = CONVERSATION_PROMPT.format(
+		from src.agents.prompts import CONVERSATION_PACKET_PROMPT
+		relationship = self.memory.summary_for(initiator.id, initiator.name)
+		prompt = CONVERSATION_PACKET_PROMPT.format(
 			speaker_name=self.actor.name,
 			speaker_role=self.actor.role.value,
-			listener_name=listener.name,
-			listener_role=listener.role.value,
+			listener_name=initiator.name,
+			listener_role=initiator.role.value,
 			relationship_history=relationship,
 			opening_line=opening_line,
 		)
@@ -322,23 +355,35 @@ class AgentBrain:
 			])
 			raw: str = response.content if hasattr(response, "content") else str(response)
 		except Exception:
-			return f"{self.actor.name} says nothing.", "No impression formed."
-		return _parse_conversation_response(raw, self.actor.name)
+			return f"{self.actor.name} says nothing.", [], "", "No impression formed."
+		return _parse_conversation_packet_response(raw, self.actor.name)
 
-def _parse_conversation_response(raw: str, actor_name: str) -> tuple[str, str]:
-	"""Extract SAY/IMPRESSION lines from a conversation LLM response."""
+def _parse_conversation_packet_response(raw: str, actor_name: str) -> tuple[str, list[str], str, str]:
+	"""Extract REPLY / FOLLOW_UP_n / IMPRESSION / TONE lines from a packet prompt response."""
 	from src.agents.response_parser import clean
 	content = clean(raw)
-	spoken = f"{actor_name} nods silently."
+	reply = f"{actor_name} nods silently."
+	follow_ups: list[str] = []
 	impression = "No strong impression."
+	tone = ""
 	for line in content.splitlines():
 		line = line.strip()
 		upper = line.upper()
-		if upper.startswith("SAY:"):
-			spoken = line.split(":", 1)[1].strip()
+		if upper.startswith("REPLY:"):
+			reply = line.split(":", 1)[1].strip()
+		elif upper.startswith("FOLLOW_UP_1:"):
+			val = line.split(":", 1)[1].strip()
+			if val:
+				follow_ups.append(val)
+		elif upper.startswith("FOLLOW_UP_2:"):
+			val = line.split(":", 1)[1].strip()
+			if val:
+				follow_ups.append(val)
 		elif upper.startswith("IMPRESSION:"):
 			impression = line.split(":", 1)[1].strip()
-	return spoken, impression
+		elif upper.startswith("TONE:"):
+			tone = line.split(":", 1)[1].strip()
+	return reply, follow_ups, tone, impression
 
 
 def create_agent_for_actor(

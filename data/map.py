@@ -120,7 +120,18 @@ def render_ascii(grid: Map, show_actors: bool = True) -> str:
 	"""
 	# Build base map from tiles.
 	char_grid = [[grid.tile_at(x, y).symbol for x in range(grid.width)] for y in range(grid.height)]
-	
+
+	# Overlay world items: stocked shelf → 's', item on floor → 'i'.
+	item_positions = {(gi.x, gi.y) for gi in grid.world_items}
+	for iy in range(grid.height):
+		for ix in range(grid.width):
+			if (ix, iy) in item_positions:
+				curr = char_grid[iy][ix]
+				if curr == "S":
+					char_grid[iy][ix] = "s"
+				elif curr == ".":
+					char_grid[iy][ix] = "i"
+
 	# Overlay actors if requested.
 	if show_actors:
 		from src.models.schema import ActorRole

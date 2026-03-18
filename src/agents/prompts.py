@@ -181,6 +181,32 @@ IMPRESSION: <your private honest one-sentence assessment of this exchange>
 """
 
 
+CONVERSATION_PACKET_PROMPT = """You are {speaker_name}, a {speaker_role} in a fantasy marketplace.
+
+Someone is speaking to you: {listener_name}, a {listener_role}.
+
+Your history with {listener_name}:
+{relationship_history}
+
+They said to you:
+"{opening_line}"
+
+Respond entirely in character. If the conversation feels like it might continue
+(curiosity, negotiation, a dispute), include 1-2 short follow-up lines you might
+say next. These should work as natural continuations regardless of exact reply.
+Leave them blank if you would not continue the conversation.
+
+Keep each line to 1-3 sentences. Non-verbal reactions are valid for any field.
+
+Format (exactly these lines, no extra text):
+REPLY: <your immediate spoken reply or non-verbal reaction, in character>
+FOLLOW_UP_1: <optional next line you might say, or leave blank>
+FOLLOW_UP_2: <optional second continuation, or leave blank>
+IMPRESSION: <your private honest one-sentence assessment of this exchange>
+TONE: <one word describing your emotional tone, e.g. guarded/warm/amused/hostile>
+"""
+
+
 def get_system_prompt_for_role(role: ActorRole) -> str:
 	"""Get the system prompt for a given actor role.
 	

@@ -32,6 +32,17 @@ class Item(BaseModel):
 	metadata: dict[str, str] = Field(default_factory=dict)
 
 
+class WorldItem(BaseModel):
+	"""An item resting on a tile — ground (floor) or shelf (shop tile)."""
+
+	item: Item
+	x: int = Field(ge=0)
+	y: int = Field(ge=0)
+	# When set, item is logically owned by that actor (e.g. shopkeeper's wares on a shelf).
+	# Treat as part of the owner's tradeable inventory; cannot be picked up without trading.
+	owner_id: str | None = None
+
+
 class Tile(BaseModel):
 	model_config = ConfigDict(frozen=True)
 
@@ -59,10 +70,66 @@ class Tile(BaseModel):
 		return symbols[self.tile_type]
 
 
-class PlannedAction(BaseModel):
-	"""A single action step in an actor's current plan."""
+class MoveParams(BaseModel):
+	"""Params for the 'move' action."""
 
-	action_type: str  # "move", "wait", "propose_trade"
+	direction: str  # one of: north, south, east, west, northeast, northwest, southeast, southwest
+
+
+class WaitParams(BaseModel):
+	"""Params for the 'wait' action. No fields required."""
+
+
+# CONVERSATION_RANGE is defined in src/agents/prompts.py (currently 8 tiles, Chebyshev distance)
+class ConverseParams(BaseModel):
+	"""Params for the 'converse' action."""
+
+	target_actor_id: str  # use the 'id' field from the observation tool, never the display name
+	opening_line: str = "Hello."
+
+
+class ProposeTradeParams(BaseModel):
+	"""Params for the 'propose_trade' action.
+
+	Item IDs are comma-separated strings referencing items in each actor's inventory.
+	Leave empty strings when no items are involved on that side of the trade.
+	"""
+
+	target_actor_id: str  # use the 'id' field from the observation tool, never the display name
+	offered_gold: int = Field(default=0, ge=0)
+	requested_gold: int = Field(default=0, ge=0)
+	offered_item_ids: str = ""   # comma-separated item IDs from proposer's inventory
+	requested_item_ids: str = ""  # comma-separated item IDs from target's inventory (includes shelf items)
+
+
+class PickUpParams(BaseModel):
+	"""Pick up an unowned item from the current tile or an adjacent tile."""
+
+	item_id: str  # Item.id of the WorldItem to pick up
+
+
+class PlaceParams(BaseModel):
+	"""Place an item from inventory onto a nearby tile.
+
+	If placed on a shop (shelf) tile, the item becomes owned by the placing actor.
+	"""
+
+	item_id: str  # Item.id from actor's inventory
+	x: int        # target tile x
+	y: int        # target tile y
+
+
+class PlannedAction(BaseModel):
+	"""A single action step in an actor's current plan.
+
+	The action_type selects the handler; params must match the corresponding model:
+	  - "move"          → MoveParams
+	  - "wait"          → WaitParams
+	  - "converse"      → ConverseParams
+	  - "propose_trade" → ProposeTradeParams
+	"""
+
+	action_type: str
 	params: dict = Field(default_factory=dict)
 	reason: str = ""
 
@@ -87,6 +154,7 @@ class Map(BaseModel):
 	height: int = Field(ge=1)
 	tiles: list[Tile]
 	actors: list[Actor] = Field(default_factory=list)
+	world_items: list[WorldItem] = Field(default_factory=list)
 
 	@model_validator(mode="after")
 	def validate_layout(self) -> "Map":
@@ -136,13 +204,36 @@ class TradeProposal(BaseModel):
 	requested_gold: int = Field(default=0, ge=0)
 
 
+class ConversationPacket(BaseModel):
+	"""Pre-planned follow-up lines the listener may deliver without a fresh LLM call.
+
+	Generated alongside the first reply in a single `conduct_conversation_packet()` call.
+	Lines are consumed in order on subsequent turns. Expires after `packet_ttl_ticks`
+	ticks so stale dialogue is never replayed.
+	"""
+
+	initiator_id: str          # actor who opened the conversation
+	lines: list[str]           # pre-planned reply lines consumed in order
+	created_tick: int          # tick the packet was generated
+	tone: str = ""             # single-word tone hint (e.g. "suspicious", "warm")
+	packet_ttl_ticks: int = 10  # discard after this many ticks
+
+
 __all__ = [
 	"TileType",
 	"ActorRole",
 	"Item",
+	"WorldItem",
+	"MoveParams",
+	"WaitParams",
+	"ConverseParams",
+	"ProposeTradeParams",
+	"PickUpParams",
+	"PlaceParams",
 	"PlannedAction",
 	"Tile",
 	"Actor",
 	"Map",
 	"TradeProposal",
+	"ConversationPacket",
 ]

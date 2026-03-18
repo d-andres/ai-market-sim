@@ -16,11 +16,39 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from src.models.schema import Actor, Map, PlannedAction, TradeProposal
+from src.models.schema import (
+	Actor,
+	ConverseParams,
+	ConversationPacket,
+	WorldItem,
+	Item,
+	Map,
+	MoveParams,
+	PickUpParams,
+	PlaceParams,
+	PlannedAction,
+	ProposeTradeParams,
+	TradeProposal,
+)
 from src.simulation import physics
 
 if TYPE_CHECKING:
 	from src.agents.brain import AgentBrain
+
+
+# ---------------------------------------------------------------------------
+# Planning cadence and load-shedding
+# ---------------------------------------------------------------------------
+
+# Minimum ticks after a plan completes before an actor re-queues for exploration.
+# Interrupt-driven replans always bypass this.
+REPLAN_CADENCE_TICKS: int = 3
+
+# Minimum ticks to wait before retrying after a planning failure.
+PLAN_FAILURE_COOLDOWN_TICKS: int = 5
+
+# Hard cap on simultaneous in-flight LLM planning requests.
+MAX_CONCURRENT_PLAN_JOBS: int = 10
 
 
 @dataclass
@@ -70,7 +98,14 @@ class SimulationEngine:
 		self._pending_plan_generation: dict[str, int] = {}
 		self.stale_plan_discard_count: int = 0
 		self.applied_plan_count: int = 0
-		
+		self._plan_last_completed_tick: dict[str, int] = {}
+		self._plan_failure_cooldown_until: dict[str, int] = {}
+		self._conversation_packets: dict[str, ConversationPacket] = {}
+		# Separate executor for conversation packet generation so it never blocks tick().
+		self._conversation_executor = ThreadPoolExecutor(max_workers=2)
+		# Keyed by listener (target) actor id → in-flight Future.
+		self._pending_packet_futures: dict[str, Future] = {}
+
 		# Initialize AI brains for each actor
 		self.agent_brains: dict[str, AgentBrain] = {}
 		if enable_ai:
@@ -179,6 +214,7 @@ class SimulationEngine:
 				actor.needs_replan = False
 				actor.interrupt_reason = ""
 				self.applied_plan_count += 1
+				self._plan_last_completed_tick[actor_id] = self.tick_count
 				self._log_event(
 					actor_id=actor.id,
 					event_type="plan",
@@ -199,6 +235,7 @@ class SimulationEngine:
 				)
 				actor.action_queue = []
 				actor.needs_replan = True
+				self._plan_failure_cooldown_until[actor_id] = self.tick_count + PLAN_FAILURE_COOLDOWN_TICKS
 
 			self._pending_plan_futures.pop(actor_id, None)
 			self._pending_plan_started_tick.pop(actor_id, None)
@@ -221,14 +258,31 @@ class SimulationEngine:
 			# Apply any plan jobs that completed since previous tick(s), without blocking.
 			self._collect_completed_plan_requests(updates)
 
-			# Submit new plan requests for actors that need planning and have no pending job.
-			for actor in self.world_map.actors:
-				brain = self.agent_brains.get(actor.id)
-				if not brain:
-					continue
-				needs_plan = actor.needs_replan or not actor.action_queue
-				if needs_plan and actor.id not in self._pending_plan_futures:
-					self._submit_plan_request(actor, brain)
+			# Submit new plan requests in priority order, respecting cadence/cooldown/cap.
+			# Priority 0 = interrupt-driven (always immediate)
+			# Priority 1 = voluntary replan
+			# Priority 2 = queue exhausted (subject to REPLAN_CADENCE_TICKS)
+			candidates = [
+				a for a in self.world_map.actors
+				if (a.needs_replan or not a.action_queue)
+				and a.id not in self._pending_plan_futures
+				and self.agent_brains.get(a.id)
+				and self._plan_failure_cooldown_until.get(a.id, 0) <= self.tick_count
+			]
+			candidates.sort(key=lambda a: (
+				0 if (a.needs_replan and a.interrupt_reason) else
+				1 if a.needs_replan else
+				2
+			))
+			for actor in candidates:
+				if len(self._pending_plan_futures) >= MAX_CONCURRENT_PLAN_JOBS:
+					break
+				# Queue-exhausted replans respect the cadence window.
+				if not actor.needs_replan:
+					last = self._plan_last_completed_tick.get(actor.id, 0)
+					if self.tick_count - last < REPLAN_CADENCE_TICKS:
+						continue
+				self._submit_plan_request(actor, self.agent_brains[actor.id])
 
 			# Keep UI status in sync with currently pending planning jobs.
 			self.llm_pending_actors = [
@@ -240,6 +294,14 @@ class SimulationEngine:
 			# Execute one step for actors with existing plans (sequential, mutates state).
 			for actor in self.world_map.actors:
 				if not actor.action_queue:
+					# Run a local reflex action while the actor waits on a pending LLM plan.
+					if actor.id in self._pending_plan_futures:
+						result = self._reflex_action(actor)
+						updates["actor_actions"].append({
+							"actor_id": actor.id,
+							"actor_name": actor.name,
+							"summary": result,
+						})
 					continue
 				action = actor.action_queue.pop(0)
 				result = self._execute_action(actor, action)
@@ -262,6 +324,11 @@ class SimulationEngine:
 
 		self.tick_count += 1
 		return updates
+
+	def _effective_inventory(self, actor: Actor) -> list[Item]:
+		"""Carried items plus any shelf items owned by this actor."""
+		shelf = [gi.item for gi in self.world_map.world_items if gi.owner_id == actor.id]
+		return list(actor.inventory) + shelf
 
 	def interrupt_actor(self, actor_id: str, reason: str) -> None:
 		"""Mark an actor as needing to replan immediately.
@@ -287,6 +354,45 @@ class SimulationEngine:
 				data={"reason": reason},
 			)
 
+	def _reflex_action(self, actor: Actor) -> str:
+		"""Execute a local fallback action when an actor has no queued plan but is waiting on LLM.
+
+		Keeps actors visibly active every tick without requiring LLM input.
+		Priority: trade-range adjacency > conversation-range awareness > idle observe.
+		"""
+		from src.agents.prompts import CONVERSATION_RANGE
+
+		# Prefer trade-range adjacency (≤2 tiles) — actor is in position and holding
+		for other in self.world_map.actors:
+			if other.id == actor.id:
+				continue
+			dist = physics.distance_chebyshev(actor.x, actor.y, other.x, other.y)
+			if dist <= 2:
+				desc = f"{actor.name} stands ready near {other.name}, waiting for a plan"
+				self._log_event(
+					actor.id, "reflex_action", desc,
+					{"nearby_actor": other.id, "dist": dist, "context": "trade_range"},
+				)
+				return desc
+
+		# Acknowledge nearby actors within conversation range (≤8 tiles)
+		for other in self.world_map.actors:
+			if other.id == actor.id:
+				continue
+			dist = physics.distance_chebyshev(actor.x, actor.y, other.x, other.y)
+			if dist <= CONVERSATION_RANGE:
+				desc = f"{actor.name} watches {other.name} nearby while gathering thoughts"
+				self._log_event(
+					actor.id, "reflex_action", desc,
+					{"nearby_actor": other.id, "dist": dist, "context": "conversation_range"},
+				)
+				return desc
+
+		# Default: hold position and observe surroundings
+		desc = f"{actor.name} pauses and observes their surroundings"
+		self._log_event(actor.id, "reflex_action", desc, {"context": "idle"})
+		return desc
+
 	def _execute_action(self, actor: Actor, action: PlannedAction) -> str:
 		"""Execute one planned action step. Returns a description of what happened.
 
@@ -294,7 +400,13 @@ class SimulationEngine:
 		is called so the LLM replans on the next tick.
 		"""
 		if action.action_type == "move":
-			direction = action.params.get("direction", "").lower().strip()
+			try:
+				p = MoveParams.model_validate(action.params)
+			except Exception as e:
+				reason = f"Invalid move params: {e}"
+				self.interrupt_actor(actor.id, reason)
+				return reason
+			direction = p.direction.lower().strip()
 			if direction not in physics.DIRECTIONS_8:
 				reason = f"Invalid direction in plan: '{direction}'"
 				self.interrupt_actor(actor.id, reason)
@@ -332,11 +444,90 @@ class SimulationEngine:
 		elif action.action_type == "propose_trade":
 			return self._execute_trade_action(actor, action.params)
 
+		elif action.action_type == "pick_up":
+			return self._execute_pickup_action(actor, action)
+
+		elif action.action_type == "place":
+			return self._execute_place_action(actor, action)
+
 		elif action.action_type == "converse":
-			return self._execute_converse_action(actor, action.params)
+			return self._execute_converse_action(actor, action)
 
 		else:
 			return f"Unknown action type: '{action.action_type}'"
+
+	def _execute_pickup_action(self, actor: Actor, action: PlannedAction) -> str:
+		"""Pick up an unowned item from the current or an adjacent tile."""
+		try:
+			p = PickUpParams.model_validate(action.params)
+		except Exception as e:
+			reason = f"Invalid pick_up params: {e}"
+			self.interrupt_actor(actor.id, reason)
+			return reason
+
+		# Search for the item within adjacency range (Chebyshev ≤ 1)
+		target_gi: WorldItem | None = None
+		for gi in self.world_map.world_items:
+			if gi.item.id == p.item_id:
+				if physics.distance_chebyshev(actor.x, actor.y, gi.x, gi.y) <= 1:
+					target_gi = gi
+					break
+
+		if target_gi is None:
+			reason = f"No item '{p.item_id}' within reach to pick up"
+			self.interrupt_actor(actor.id, reason)
+			return reason
+
+		if target_gi.owner_id is not None and target_gi.owner_id != actor.id:
+			owner = self._actor_by_id(target_gi.owner_id)
+			owner_name = owner.name if owner else target_gi.owner_id
+			reason = f"'{target_gi.item.name}' belongs to {owner_name} — propose a trade to acquire it"
+			self.interrupt_actor(actor.id, reason)
+			return reason
+
+		# Transfer: remove from ground, add to inventory
+		self.world_map.world_items = [
+			gi for gi in self.world_map.world_items if gi is not target_gi
+		]
+		actor.inventory.append(target_gi.item)
+		desc = f"{actor.name} picked up {target_gi.item.name} x{target_gi.item.quantity}"
+		self._log_event(actor.id, "pick_up", desc, {"item_id": target_gi.item.id, "x": target_gi.x, "y": target_gi.y})
+		return desc
+
+	def _execute_place_action(self, actor: Actor, action: PlannedAction) -> str:
+		"""Place an item from inventory onto a nearby tile."""
+		try:
+			p = PlaceParams.model_validate(action.params)
+		except Exception as e:
+			reason = f"Invalid place params: {e}"
+			self.interrupt_actor(actor.id, reason)
+			return reason
+
+		if physics.distance_chebyshev(actor.x, actor.y, p.x, p.y) > 1:
+			reason = f"Tile ({p.x},{p.y}) is too far away to place on"
+			self.interrupt_actor(actor.id, reason)
+			return reason
+
+		if not self.world_map.in_bounds(p.x, p.y):
+			reason = f"Tile ({p.x},{p.y}) is out of map bounds"
+			self.interrupt_actor(actor.id, reason)
+			return reason
+
+		item = next((i for i in actor.inventory if i.id == p.item_id), None)
+		if item is None:
+			reason = f"{actor.name} does not have item '{p.item_id}' in inventory"
+			self.interrupt_actor(actor.id, reason)
+			return reason
+
+		actor.inventory = [i for i in actor.inventory if i.id != p.item_id]
+		tile = self.world_map.tile_at(p.x, p.y)
+		# Items placed on a shop tile are owned by the placing actor (their shelf)
+		owner_id = actor.id if tile.tile_type.value == "shop" else None
+		self.world_map.world_items.append(WorldItem(item=item, x=p.x, y=p.y, owner_id=owner_id))
+		loc = "shelf" if tile.tile_type.value == "shop" else "ground"
+		desc = f"{actor.name} placed {item.name} on the {loc} at ({p.x},{p.y})"
+		self._log_event(actor.id, "place", desc, {"item_id": item.id, "x": p.x, "y": p.y, "location": loc})
+		return desc
 
 	def _resolve_actor(self, target_id: str) -> Actor | None:
 		"""Find an actor by id, falling back to case-insensitive name match."""
@@ -346,13 +537,22 @@ class SimulationEngine:
 		lower = target_id.lower()
 		return next((a for a in self.world_map.actors if a.name.lower() == lower), None)
 
-	def _execute_converse_action(self, actor: Actor, params: dict) -> str:
-		"""Execute a converse action: initiator speaks, listener replies, both record memory."""
+	def _execute_converse_action(self, actor: Actor, action: PlannedAction) -> str:
+		"""Execute a converse action: initiator speaks, listener replies, both record memory.
+
+		Conversation packet generation is non-blocking: the LLM call is submitted to a
+		dedicated executor and the action is re-queued until the reply is ready.
+		"""
 		from src.agents.prompts import CONVERSATION_RANGE
-		target_id = params.get("target_actor_id", "")
-		target = self._resolve_actor(target_id)
+		try:
+			p = ConverseParams.model_validate(action.params)
+		except Exception as e:
+			reason = f"Invalid converse params: {e}"
+			self.interrupt_actor(actor.id, reason)
+			return reason
+		target = self._resolve_actor(p.target_actor_id)
 		if target is None:
-			return f"{actor.name} tries to speak but finds no one called '{target_id}'."
+			return f"{actor.name} tries to speak but finds no one called '{p.target_actor_id}'."
 
 		dist = physics.distance_chebyshev(actor.x, actor.y, target.x, target.y)
 		if dist > CONVERSATION_RANGE:
@@ -360,12 +560,56 @@ class SimulationEngine:
 			self.interrupt_actor(actor.id, reason)
 			return reason
 
-		opening_line = params.get("opening_line", "Hello.").strip() or "Hello."
+		opening_line = p.opening_line.strip() or "Hello."
 
-		# Listener's brain generates a reply and a private impression
 		listener_brain = self.agent_brains.get(target.id)
 		if listener_brain:
-			reply, listener_impression = listener_brain.conduct_conversation(actor, opening_line)
+			# ── Non-blocking packet resolution ───────────────────────────────
+			packet_future = self._pending_packet_futures.get(target.id)
+
+			if packet_future is not None:
+				if not packet_future.done():
+					# LLM still generating — retry this action next tick
+					actor.action_queue.insert(0, action)
+					return f"{actor.name} waits for {target.name} to formulate a reply..."
+				# Future finished — collect result
+				try:
+					c_reply, c_follow_ups, c_tone, c_impression = packet_future.result()
+				except Exception:
+					c_reply, c_follow_ups, c_tone, c_impression = "*nods but says nothing*", [], "", "No impression formed."
+				self._pending_packet_futures.pop(target.id, None)
+				reply = c_reply
+				listener_impression = c_impression
+				if c_follow_ups:
+					self._conversation_packets[target.id] = ConversationPacket(
+						initiator_id=actor.id,
+						lines=c_follow_ups,
+						created_tick=self.tick_count,
+						tone=c_tone,
+					)
+			else:
+				# Check cached packet first
+				packet = self._conversation_packets.get(target.id)
+				packet_valid = (
+					packet is not None
+					and packet.initiator_id == actor.id
+					and (self.tick_count - packet.created_tick) < packet.packet_ttl_ticks
+					and bool(packet.lines)
+				)
+				if packet_valid:
+					reply = packet.lines.pop(0)
+					listener_impression = f"(continuing, tone: {packet.tone})" if packet.tone else "(continuing)"
+					if not packet.lines:
+						del self._conversation_packets[target.id]
+				else:
+					# No cache and no pending future — submit non-blocking LLM call
+					self._pending_packet_futures[target.id] = self._conversation_executor.submit(
+						listener_brain.conduct_conversation_packet, actor, opening_line
+					)
+					self.llm_call_count += 1
+					actor.action_queue.insert(0, action)
+					return f"{actor.name} says to {target.name}: '{opening_line}' (waiting for reply...)"
+
 		else:
 			reply = "*nods but says nothing*"
 			listener_impression = "No impression formed."
@@ -374,7 +618,7 @@ class SimulationEngine:
 		self._log_event(
 			actor.id, "converse",
 			f'{actor.name} says to {target.name}: "{opening_line}"',
-			{"target_id": target_id, "line": opening_line},
+			{"target_id": p.target_actor_id, "line": opening_line},
 		)
 		self._log_event(
 			target.id, "converse",
@@ -411,10 +655,15 @@ class SimulationEngine:
 
 	def _execute_trade_action(self, actor: Actor, params: dict) -> str:
 		"""Execute a propose_trade action step."""
-		target_id = params.get("target_actor_id", "")
-		target = self._resolve_actor(target_id)
+		try:
+			p = ProposeTradeParams.model_validate(params)
+		except Exception as e:
+			reason = f"Invalid propose_trade params: {e}"
+			self.interrupt_actor(actor.id, reason)
+			return reason
+		target = self._resolve_actor(p.target_actor_id)
 		if target is None:
-			reason = f"Trade target '{target_id}' not found"
+			reason = f"Trade target '{p.target_actor_id}' not found"
 			self.interrupt_actor(actor.id, reason)
 			return reason
 
@@ -424,13 +673,12 @@ class SimulationEngine:
 			self.interrupt_actor(actor.id, reason)
 			return reason
 
-		offered_gold = int(params.get("offered_gold", 0))
-		requested_gold = int(params.get("requested_gold", 0))
-
 		def _resolve_items(id_str: str, owner: Actor) -> tuple[list, str | None]:
 			if not id_str or not id_str.strip():
 				return [], None
-			inv = {i.id: i for i in owner.inventory}
+			# Effective inventory = carried items + owned shelf items
+			eff_inv = self._effective_inventory(owner)
+			inv = {i.id: i for i in eff_inv}
 			matched = []
 			for iid in [s.strip() for s in id_str.split(",") if s.strip()]:
 				if iid not in inv:
@@ -438,11 +686,11 @@ class SimulationEngine:
 				matched.append(inv[iid])
 			return matched, None
 
-		offered_items, err = _resolve_items(params.get("offered_item_ids", ""), actor)
+		offered_items, err = _resolve_items(p.offered_item_ids, actor)
 		if err:
 			self.interrupt_actor(actor.id, err)
 			return err
-		requested_items, err = _resolve_items(params.get("requested_item_ids", ""), target)
+		requested_items, err = _resolve_items(p.requested_item_ids, target)
 		if err:
 			self.interrupt_actor(actor.id, err)
 			return err
@@ -451,9 +699,9 @@ class SimulationEngine:
 			proposer_id=actor.id,
 			target_id=target.id,
 			offered_items=offered_items,
-			offered_gold=offered_gold,
+			offered_gold=p.offered_gold,
 			requested_items=requested_items,
-			requested_gold=requested_gold,
+			requested_gold=p.requested_gold,
 		)
 		return self.evaluate_trade_proposal(proposal=proposal, proposer=actor, target=target)
 
@@ -596,6 +844,7 @@ class SimulationEngine:
 
 		Returns None on success, or an error string if the trade is no longer
 		valid (e.g. gold or items changed between evaluation and execution).
+		Handles shelf items (owned WorldItems) on the target's side.
 		"""
 		# Re-validate gold
 		if proposal.offered_gold > proposer.gold:
@@ -603,14 +852,21 @@ class SimulationEngine:
 		if proposal.requested_gold > target.gold:
 			return f"{target.name} no longer has enough gold."
 
-		# Re-validate items still in inventory
-		proposer_inv = {item.id: item for item in proposer.inventory}
-		target_inv = {item.id: item for item in target.inventory}
+		# Re-validate items (proposer must carry offered items)
+		proposer_carried = {item.id: item for item in proposer.inventory}
 		for item in proposal.offered_items:
-			if item.id not in proposer_inv:
+			if item.id not in proposer_carried:
 				return f"{proposer.name} no longer has {item.name}."
+
+		# Requested items may be in target's carried inventory OR on their shelf
+		target_carried = {item.id: item for item in target.inventory}
+		target_shelf: dict[str, WorldItem] = {
+			gi.item.id: gi
+			for gi in self.world_map.world_items
+			if gi.owner_id == target.id
+		}
 		for item in proposal.requested_items:
-			if item.id not in target_inv:
+			if item.id not in target_carried and item.id not in target_shelf:
 				return f"{target.name} no longer has {item.name}."
 
 		# Transfer gold
@@ -619,14 +875,20 @@ class SimulationEngine:
 		target.gold += proposal.offered_gold
 		target.gold -= proposal.requested_gold
 
-		# Transfer items: offered items go from proposer → target
+		# Transfer offered items: proposer carried → target inventory
 		for item in proposal.offered_items:
 			proposer.inventory = [i for i in proposer.inventory if i.id != item.id]
 			target.inventory.append(item)
 
-		# Requested items go from target → proposer
+		# Transfer requested items: target (carried or shelf) → proposer inventory
 		for item in proposal.requested_items:
-			target.inventory = [i for i in target.inventory if i.id != item.id]
+			if item.id in target_shelf:
+				# Remove from the world items list
+				self.world_map.world_items = [
+					gi for gi in self.world_map.world_items if gi.item.id != item.id
+				]
+			else:
+				target.inventory = [i for i in target.inventory if i.id != item.id]
 			proposer.inventory.append(item)
 
 		return None
