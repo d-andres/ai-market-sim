@@ -41,11 +41,12 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 # Minimum ticks after a plan completes before an actor re-queues for exploration.
-# Interrupt-driven replans always bypass this.
-REPLAN_CADENCE_TICKS: int = 3
+# Only critical-interrupt replans (interrupt_reason set) bypass this.
+# At the default 2s/tick this equals 46 seconds.
+REPLAN_CADENCE_TICKS: int = 23
 
-# Minimum ticks to wait before retrying after a planning failure.
-PLAN_FAILURE_COOLDOWN_TICKS: int = 5
+# Minimum ticks to wait before retrying after a planning failure (≈ 30 seconds).
+PLAN_FAILURE_COOLDOWN_TICKS: int = 15
 
 # Hard cap on simultaneous in-flight LLM planning requests.
 MAX_CONCURRENT_PLAN_JOBS: int = 10
@@ -259,9 +260,9 @@ class SimulationEngine:
 			self._collect_completed_plan_requests(updates)
 
 			# Submit new plan requests in priority order, respecting cadence/cooldown/cap.
-			# Priority 0 = interrupt-driven (always immediate)
-			# Priority 1 = voluntary replan
-			# Priority 2 = queue exhausted (subject to REPLAN_CADENCE_TICKS)
+			# Priority 0 = critical interrupt (needs_replan + interrupt_reason) → always immediate
+			# Priority 1 = voluntary replan or soft replan  → subject to REPLAN_CADENCE_TICKS
+			# Priority 2 = queue exhausted                  → subject to REPLAN_CADENCE_TICKS
 			candidates = [
 				a for a in self.world_map.actors
 				if (a.needs_replan or not a.action_queue)
@@ -277,8 +278,9 @@ class SimulationEngine:
 			for actor in candidates:
 				if len(self._pending_plan_futures) >= MAX_CONCURRENT_PLAN_JOBS:
 					break
-				# Queue-exhausted replans respect the cadence window.
-				if not actor.needs_replan:
+				# Critical interrupts (interrupt_reason set) bypass cadence; everything else waits.
+				is_critical = actor.needs_replan and bool(actor.interrupt_reason)
+				if not is_critical:
 					last = self._plan_last_completed_tick.get(actor.id, 0)
 					if self.tick_count - last < REPLAN_CADENCE_TICKS:
 						continue
@@ -642,14 +644,9 @@ class SimulationEngine:
 				event_type="converse",
 				notes=f"{actor.name} said: \"{opening_line}\" — I replied: \"{reply}\". My impression: {listener_impression}",
 			)
-			# Soft interrupt: listener replans next tick knowing they were just addressed
-			# Only interrupt if they don't already have a converse or trade step queued
-			next_action = target.action_queue[0].action_type if target.action_queue else None
-			if next_action not in ("converse", "propose_trade"):
-				self.interrupt_actor(
-					target.id,
-					f"{actor.name} just spoke to you: \"{opening_line}\" — you replied: \"{reply}\". You may respond further or continue what you were doing.",
-				)
+			# The listener has already recorded the conversation in memory; they will
+			# naturally incorporate it when their current plan exhausts and cadence allows.
+			# No interrupt needed — conversations are non-critical events.
 
 		return f'{actor.name} → {target.name}: "{opening_line}" | {target.name}: "{reply}"'
 

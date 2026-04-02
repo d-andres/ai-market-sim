@@ -193,7 +193,7 @@ class AgentBrain:
 	"""
 
 	# How many steps the LLM is asked to plan at once.
-	PLAN_HORIZON: int = 8
+	PLAN_HORIZON: int = 30
 
 	def __init__(
 		self,
@@ -238,7 +238,9 @@ class AgentBrain:
 			f"Gold: {self.actor.gold}g | Carrying: {inv_summary}\n\n"
 			f"WORLD OBSERVATION:\n{observation}"
 			f"{interrupt_ctx}\n\n"
-			f"Create a plan of up to {self.PLAN_HORIZON} steps.\n"
+			f"Create a plan of {self.PLAN_HORIZON} steps (fill all {self.PLAN_HORIZON} — do not stop early). "
+			f"Chain multiple goals: move somewhere, do something, then move somewhere else. "
+			f"Use wait steps only when genuinely idle between goals.\n"
 			"MOVEMENT REMINDER: y increases southward. To move toward a higher y, go south. To move toward a lower y, go north. To move toward a higher x, go east. To move toward a lower x, go west.\n"
 			"TRADE REMINDER: if an actor is marked [TRADE RANGE], do NOT move — use propose_trade immediately.\n"
 			"CONVERSE REMINDER: if an actor is marked [CONVERSATION RANGE], you may use converse to talk with them — useful for building relationships, gathering information, or roleplay.\n"
