@@ -1,23 +1,50 @@
 # AI Agent Integration Guide
 
-This guide explains how to integrate LLM-powered AI agents into the ai-market-sim project. Actors (Guards, Shopkeepers, and Players) can be controlled by AI "brains" that use Large Language Models to make autonomous decisions.
+This guide explains how LLM-powered AI agents work in ai-market-sim. Actors (Guards, Shopkeepers, and Players) are controlled by `AgentBrain` instances that use Large Language Models to plan, trade, converse, and fight autonomously.
 
-## Overview
+## Architecture
 
-Each actor in the simulation has an `AgentBrain` that:
-1. **Observes** the world using registered tools
-2. **Reasons** about the situation using an LLM
-3. **Acts** by calling tools (move, wait, interact)
+Each actor's `AgentBrain` (`src/agents/brain.py`) wraps a **LiteLLMModel** from `smolagents[litellm]`. This supports any backend that LiteLLM can route to — Ollama, OpenAI, Anthropic, etc. There is no `CodeAgent`; all LLM calls are direct `ChatMessage` requests with structured response parsing.
 
-The system uses **Smolagents** as the agentic framework with **Ollama** as the configured model backend.
+### Planning Flow
 
-## AI Tools Available to Agents
+1. **Observe** — `ObserveSurroundingsTool` builds a text description of the actor's position, gold, inventory, visible actors/items, relationship history.
+2. **Plan** — The LLM receives the observation + role-specific system prompt and returns a JSON plan of up to `PLAN_HORIZON = 30` action steps.
+3. **Execute** — The engine pops one action per tick from the queue and dispatches it.
+4. **Replan** — When the queue empties, an interrupt occurs, or `REPLAN_CADENCE_TICKS = 23` ticks elapse, a new plan is requested.
 
-Agents can perform these actions each turn:
+Planning runs on a background `ThreadPoolExecutor`; the tick loop never blocks on LLM latency. Actors with empty queues run local **reflex actions** (wander, hold, greet) instead of freezing.
 
-- **`observe_surroundings(vision_range=10)`** - See nearby tiles, actors, and shops within range
-- **`move(direction)`** - Move in 8 directions: north, south, east, west, northeast, northwest, southeast, southwest
-- **`wait()`** - Stay still and observe without moving
+### Adaptive Fallback
+
+When primary planning fails, `AgentBrain` uses an AI-authored **fallback policy** (identity summary, goals, tactics, risk posture) to generate a smaller 10-step recovery plan. The policy refreshes every `FALLBACK_POLICY_TTL_TICKS = 40` ticks.
+
+## Action Types
+
+Agents can plan any of these actions each step:
+
+| Action | Params | Description |
+|---|---|---|
+| `move` | `direction` (8-directional) | Walk to adjacent tile; blocked by walls/actors |
+| `wait` | — | Idle observation |
+| `propose_trade` | `target_actor_id`, gold/item offers | Trigger LLM trade evaluation on target |
+| `pick_up` | `item_id` | Pick up unowned floor item (owned = theft) |
+| `place` | `item_id`, `x`, `y` | Drop item on tile; shop tile sets owner\_id |
+| `converse` | `target_actor_id`, `opening_line` | Non-blocking conversation via packet system |
+| `attack` | `target_actor_id` | Melee strike (Chebyshev ≤ 1); triggers crime if unprovoked |
+| `equip` | `item_id` | Move inventory item to equipment slot |
+| `unequip` | `slot` | Return equipped item to inventory |
+| `use_item` | `item_id` | Consume item (heal, buff, poison, etc.) |
+
+## Role Prompts
+
+Role-specific system prompts live in `src/agents/prompts.py`:
+
+- **`GUARD_PROMPT`** — Patrol marketplace, investigate suspicious behaviour, maintain order.
+- **`SHOPKEEPER_PROMPT`** — Manage inventory, negotiate trades, maximise profit, protect stock.
+- **`PLAYER_PROMPT`** — Acquire high-value items through negotiation, deception, theft, or violence.
+
+Additional prompts: `TRADE_EVALUATION_PROMPT`, `CONVERSATION_PACKET_PROMPT`, `DIALOGUE_SOCIAL_IMPACT_PROMPT`, `ADAPTIVE_FALLBACK_POLICY_PROMPT`, `ADAPTIVE_FALLBACK_PLAN_PROMPT`.
 
 ## Prerequisites
 
@@ -26,225 +53,88 @@ Agents can perform these actions each turn:
 pip install -r requirements.txt
 ```
 
-This installs:
-- `smolagents` - Agentic framework
-- `ollama` - Python client for Ollama (if using Ollama)
-- Other required packages (fastapi, nicegui, pydantic, etc.)
+### 2. Install & Start Ollama
 
----
-
-## Ollama Integration
-
-**Pros:**
-- Free and runs entirely offline
-- No API keys required
-- Fast iteration during development
-- Privacy - your data never leaves your machine
-
-**Cons:**
-- Requires local compute resources
-- Model quality depends on hardware
-
-### Installation
-
-#### Windows
-```powershell
-# Using winget (recommended)
+```bash
+# Windows
 winget install Ollama.Ollama
 
-# Or download installer from:
-# https://ollama.com/download
-```
-
-#### macOS
-```bash
-# Using Homebrew
+# macOS
 brew install ollama
 
-# Or download from:
-# https://ollama.com/download
-```
-
-#### Linux
-```bash
+# Linux
 curl -fsSL https://ollama.com/install.sh | sh
 ```
 
-### Start Ollama Server
-```bash
-# The service usually starts automatically after installation
-# Verify it's running by visiting:
-# http://localhost:11434
-
-# Or start manually:
-ollama serve
-```
-
-### Pull a Model
-```bash
-# Option 1: llama3.2 (recommended, balanced performance)
-ollama pull llama3.2
-
-# Option 2: mistral (larger, more capable)
-ollama pull mistral
-
-# Option 3: phi3 (smaller, faster, less capable)
-ollama pull phi3
-
-# See all models: https://ollama.com/library
-```
-
-### Quick Workflow: Cloudflared Tunnel to Hugging Face Spaces
-
-Use this when Ollama runs on your local machine, but your app runs on Hugging Face Spaces.
-
-1. Start Ollama locally:
 ```bash
 ollama serve
+ollama pull qwen3:4b    # or any model: llama3.2, mistral, phi3
 ```
 
-2. Start a quick Cloudflared tunnel to Ollama:
+### 3. Configure Environment
+
+Copy `.env.example` to `.env`:
+```env
+LLM_MODEL=ollama/qwen3:4b
+OLLAMA_BASE_URL=http://localhost:11434
+ENABLE_AI=true
+TICK_RATE=2.0
+```
+
+Model name format: always prefix with `ollama/` (e.g., `ollama/qwen3:4b`, `ollama/llama3.2`).
+
+## Cloudflared Tunnel (Hugging Face Spaces)
+
+When Ollama runs locally but the app runs on HF Spaces:
+
 ```bash
+ollama serve
 cloudflared tunnel --url http://localhost:11434
 ```
 
-3. Copy the generated URL (example: `https://abc123.trycloudflare.com`).
+Copy the generated URL and set `OLLAMA_BASE_URL` in HF Space Settings → Variables and Secrets. Quick tunnel URLs change on restart.
 
-4. In your Hugging Face Space, update Settings -> Variables and Secrets:
-- Variable or Secret: `OLLAMA_BASE_URL=https://abc123.trycloudflare.com`
-- Variable: `LLM_MODEL=ollama/llama3.2`
-- Variable: `ENABLE_AI=true`
-- Variable: `TICK_RATE=2.0`
+## Running
 
-5. Restart the Hugging Face Space so it picks up the new values.
-
-Notes:
-- Quick tunnel URLs change whenever you restart Cloudflared.
-- When that happens, update only `OLLAMA_BASE_URL` in Hugging Face Space and restart.
-- Keep both `ollama serve` and `cloudflared tunnel --url ...` running on your local machine.
-
-### Configure in main.py
-```python
-engine = initialize_engine(
-    DEFAULT_MARKET,
-    tick_rate=float(os.getenv("TICK_RATE", "2.0")),
-    enable_ai=_env_bool("ENABLE_AI", True),
-    ollama_model=os.getenv("LLM_MODEL", "ollama/llama3.2"),
-    ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
-)
-```
-
-**Model name format:** Always prefix with `ollama/` (e.g., `ollama/llama3.2`, `ollama/mistral`)
-
----
-
-## Configuration
-
-### Enable/Disable AI
-
-Toggle AI agents on or off in [main.py](main.py):
-```python
-engine = initialize_engine(
-    DEFAULT_MARKET,
-    tick_rate=float(os.getenv("TICK_RATE", "2.0")),
-    enable_ai=_env_bool("ENABLE_AI", True),
-    ollama_model=os.getenv("LLM_MODEL", "ollama/llama3.2"),
-    ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
-)
-```
-
-For Hugging Face Spaces, set these in Settings -> Variables and Secrets:
-- `OLLAMA_BASE_URL`
-- `LLM_MODEL`
-- `ENABLE_AI`
-- `TICK_RATE`
-
-### Adjust Tick Speed
-
-Control how often agents take turns:
-```python
-tick_rate=5.0  # Slower: 1 tick every 5 seconds (easier to observe)
-tick_rate=1.0  # Faster: 1 tick every second
-```
-
-### Change Default Vision Range
-
-Edit [src/agents/brain.py](src/agents/brain.py) line 35:
-```python
-"default": 10,  # Change to any value (tiles)
-```
-
-### Limit Agent Reasoning Steps
-
-Edit [src/agents/brain.py](src/agents/brain.py) line 189:
-```python
-self.agent = CodeAgent(
-    tools=self.tools,
-    model=self.model,
-    system_prompt=system_prompt,
-    max_steps=3,  # Increase for more complex reasoning chains
-)
-```
-
----
-
-## Running the Simulation
-
-### Start the Server
 ```bash
 python main.py
 ```
 
-Visit **http://localhost:8080** to access the dashboard.
+Visit **http://localhost:7860**. Click **GENERATE MAP** to initialize the world. Once initial LLM plans complete, the simulation goes live.
 
-### What You'll See
+### Dashboard
 
-The dashboard displays:
-- **World Map** - ASCII grid showing actor positions
-- **Simulation Heartbeat** - Tick counter and elapsed time
-- **Recent Events** - Last 10 agent actions with descriptions
-- **State Inspector** - Full JSON state snapshot
-- **Physics Debug** - FOV and pathfinding data per actor
+- **ASCII map** — tile grid with actor positions and item markers
+- **Event log** — colour-coded by type (red = combat, orange = crime, cyan = trade, etc.)
+- **Play/Pause** — toggle simulation ticking
+- **LLM call counter** — total and pending planning requests
 
-### Observing Agent Decisions
+## Key Constants
 
-Watch the **Recent Events** panel to see agents making autonomous decisions:
-```
-Tick 3: Thorne (guard) - "Moved east to (6,5)"
-Tick 3: Elara (shopkeeper) - "Waiting and observing"
-Tick 3: Adventurer (player) - "Moved north to (10,9)"
-```
-
----
+| Constant | File | Value | Meaning |
+|---|---|---|---|
+| `PLAN_HORIZON` | `brain.py` | `30` | Steps per LLM plan (~60s at 2s/tick) |
+| `REPLAN_CADENCE_TICKS` | `engine.py` | `23` | ~46s between routine replans |
+| `PLAN_FAILURE_COOLDOWN_TICKS` | `engine.py` | `15` | ~30s retry wait after failure |
+| `MAX_CONCURRENT_PLAN_JOBS` | `engine.py` | `10` | Max simultaneous LLM requests |
+| `CONVERSATION_RANGE` | `prompts.py` | `8` | Max Chebyshev tiles for converse |
+| `WITNESS_VISION_RANGE` | `engine.py` | `10` | Tiles within which actors witness crimes |
+| `SELF_DEFENSE_WINDOW_TICKS` | `engine.py` | `12` | Retaliation exempt from crime within this window |
 
 ## Troubleshooting
 
-### "Import smolagents could not be resolved"
-```bash
-pip install smolagents
-```
-
 ### Ollama: "Connection refused"
-- Make sure Ollama is running: `ollama serve`
+- Ensure Ollama is running: `ollama serve`
 - Verify at: http://localhost:11434
-- Check `OLLAMA_BASE_URL` in Hugging Face Spaces matches your current Cloudflared URL
+- Check `OLLAMA_BASE_URL` matches your tunnel URL on HF Spaces
 
 ### Ollama: "Model not found"
 ```bash
-# Pull the model first
-ollama pull llama3.2
-
-# List installed models
+ollama pull qwen3:4b
 ollama list
 ```
 
-### Agents taking too long to respond
-- **Try a smaller/faster model:** `ollama/phi3`
-- **Reduce max_steps** in brain.py (e.g., from 3 to 1)
-- **Increase tick_rate** for slower ticks (more time between decisions)
-
 ### Agents making illogical moves
-- **Check system prompts** in `src/agents/prompts.py`
-- **Try a more capable model:** `ollama/mistral`
-- **Increase max_steps** for more reasoning (e.g., 3 → 5)
-- **Verify agent can see targets:** Check vision_range is sufficient
+- Check system prompts in `src/agents/prompts.py`
+- Try a more capable model (`ollama/mistral`, `ollama/llama3.2`)
+- Verify agent can see targets (default vision range: 10 tiles)

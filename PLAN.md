@@ -149,7 +149,6 @@ Status: COMPLETED
 Use engine-local runtime state first (no schema expansion initially). If stable, migrate selected fields into actor schema later.
 
 ## Out of Scope for This Branch
-- Full combat system implementation.
 - Economic model redesign.
 - Multi-model orchestration.
 
