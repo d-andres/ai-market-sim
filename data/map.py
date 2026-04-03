@@ -150,56 +150,12 @@ def render_ascii(grid: Map, show_actors: bool = True) -> str:
 	return "\n".join("".join(row) for row in char_grid)
 
 
-DEFAULT_MAP: Map = load_or_build_default_map()
-
-# Add test actors for physics demonstration.
-from src.models.schema import Actor, ActorRole
-
-if not DEFAULT_MAP.actors:  # Only add if no actors exist.
-	DEFAULT_MAP.actors = [
-		Actor(
-			id="guard_1",
-			name="Guard Thorne",
-			role=ActorRole.GUARD,
-			x=5,
-			y=5,
-			gold=50,
-			hp=100,
-		),
-		Actor(
-			id="shopkeeper_1",
-			name="Merchant Elara",
-			role=ActorRole.SHOPKEEPER,
-			x=10,
-			y=3,
-			gold=200,
-			hp=80,
-		),
-		Actor(
-			id="player",
-			name="Adventurer",
-			role=ActorRole.PLAYER,
-			x=10,
-			y=10,
-			gold=0,
-			hp=100,
-		),
-	]
-
-# Backward-compatibility names used by current src/main.py.
-build_default_market = build_default_map
-DEFAULT_MARKET = DEFAULT_MAP
-
-
 __all__ = [
 	"DEFAULT_MAP_PATH",
 	"build_default_map",
-	"build_default_market",
 	"load_map_from_json",
 	"load_or_build_default_map",
 	"get_wall_coordinates",
 	"get_shop_locations",
 	"render_ascii",
-	"DEFAULT_MAP",
-	"DEFAULT_MARKET",
 ]

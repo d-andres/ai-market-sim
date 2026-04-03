@@ -9,13 +9,14 @@ import os
 import threading
 import time
 from threading import Lock
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from fastapi import FastAPI
 from nicegui import ui
 
 from data import load_or_build_default_map, render_ascii, load_item_catalog
 from src.ui import register_pages
-from src.models.schema import Actor, ActorRole, WorldItem
+from src.models.schema import Actor, ActorRole, PlannedAction, WorldItem
 from src.simulation.physics import get_visible_tiles_and_actors, breadth_first_search
 from src.simulation.engine import initialize_engine
 
@@ -61,6 +62,7 @@ _runtime_state = {
     "error": "",
     "initial_plan_expected": 0,
     "initial_plan_completed": 0,
+    "block_on_initial_plans": True,
     "paused": True,
 }
 
@@ -111,6 +113,7 @@ def _default_actors() -> list[Actor]:
             x=5,
             y=5,
             gold=50,
+            personality_traits=["vigilant", "dutiful", "suspicious"],
             hp=100,
             max_hp=100,
             base_attack=8,
@@ -126,6 +129,7 @@ def _default_actors() -> list[Actor]:
             x=10,
             y=3,
             gold=200,
+            personality_traits=["shrewd", "protective", "persuasive"],
             hp=80,
             max_hp=80,
             base_attack=4,
@@ -140,6 +144,7 @@ def _default_actors() -> list[Actor]:
             x=10,
             y=10,
             gold=50,
+            personality_traits=["ambitious", "adaptive", "risk_tolerant"],
             hp=100,
             max_hp=100,
             base_attack=6,
@@ -159,6 +164,7 @@ def get_generation_status() -> dict:
     with _runtime_lock:
         expected = int(_runtime_state["initial_plan_expected"])
         completed = int(_runtime_state["initial_plan_completed"])
+        block_on_initial_plans = bool(_runtime_state["block_on_initial_plans"])
         return {
             "ready": bool(_runtime_state["ready"]),
             "generating": bool(_runtime_state["generating"]),
@@ -166,11 +172,15 @@ def get_generation_status() -> dict:
             "initial_plan_expected": expected,
             "initial_plan_completed": completed,
             "awaiting_responses": max(0, expected - completed),
+            "block_on_initial_plans": block_on_initial_plans,
         }
 
 
 def generate_world() -> None:
     """Generate map, initialize engine, and run initial planning before going live."""
+    # Default behavior is blocking warm-up so actors start with ready plans.
+    block_on_initial_plans = _env_bool("BLOCK_ON_INITIAL_PLANS", True)
+
     with _runtime_lock:
         if _runtime_state["ready"] or _runtime_state["generating"]:
             return
@@ -178,6 +188,7 @@ def generate_world() -> None:
         _runtime_state["error"] = ""
         _runtime_state["initial_plan_expected"] = 0
         _runtime_state["initial_plan_completed"] = 0
+        _runtime_state["block_on_initial_plans"] = block_on_initial_plans
 
     try:
         world_map = load_or_build_default_map()
@@ -193,29 +204,66 @@ def generate_world() -> None:
             ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
         )
 
+        # Warm up mode:
+        # - default (blocking): wait for all initial plans before world becomes ready
+        # - non-blocking opt-out: set BLOCK_ON_INITIAL_PLANS=false
+
         # Warm up: one initial plan per actor so simulation starts with intent.
         if engine.enable_ai:
             initial_targets = [a for a in world_map.actors if engine.agent_brains.get(a.id)]
             with _runtime_lock:
-                _runtime_state["initial_plan_expected"] = len(initial_targets)
-                _runtime_state["initial_plan_completed"] = 0
+                if block_on_initial_plans:
+                    _runtime_state["initial_plan_expected"] = len(initial_targets)
+                    _runtime_state["initial_plan_completed"] = 0
+                else:
+                    _runtime_state["initial_plan_expected"] = 0
+                    _runtime_state["initial_plan_completed"] = 0
 
-            for actor in world_map.actors:
-                brain = engine.agent_brains.get(actor.id)
-                if not brain:
-                    continue
-                plan, thought_summary = brain.create_plan()
-                actor.action_queue = plan
-                actor.needs_replan = False
-                actor.interrupt_reason = ""
+            if block_on_initial_plans and initial_targets:
+                max_workers = max(1, len(initial_targets))
+                with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                    future_to_actor = {
+                        pool.submit(engine.agent_brains[a.id].create_plan, "", False): a
+                        for a in initial_targets
+                    }
+                    for future in as_completed(future_to_actor):
+                        actor = future_to_actor[future]
+                        try:
+                            plan, thought_summary = future.result()
+                        except Exception as exc:  # noqa: BLE001
+                            plan = [
+                                PlannedAction(
+                                    action_type="wait",
+                                    params={},
+                                    reason=f"Initial plan generation failed: {exc}",
+                                )
+                            ]
+                            thought_summary = f"{actor.name} failed to generate an initial plan and will retry in simulation."
+
+                        actor.action_queue = plan
+                        actor.needs_replan = False
+                        actor.interrupt_reason = ""
+                        engine._log_event(
+                            actor_id=actor.id,
+                            event_type="plan",
+                            description=thought_summary,
+                            data={"steps": len(plan), "initial": True},
+                        )
+                        with _runtime_lock:
+                            _runtime_state["initial_plan_completed"] += 1
+            elif initial_targets:
+                for actor in initial_targets:
+                    # Let the simulation start immediately; the regular tick loop
+                    # will request/apply plans concurrently without blocking generation.
+                    actor.action_queue = []
+                    actor.needs_replan = True
+                    actor.interrupt_reason = ""
                 engine._log_event(
-                    actor_id=actor.id,
-                    event_type="plan",
-                    description=thought_summary,
-                    data={"steps": len(plan), "initial": True},
+                    actor_id="system",
+                    event_type="init",
+                    description="Initial plan warm-up deferred to runtime ticks (non-blocking mode).",
+                    data={"actors": len(initial_targets)},
                 )
-                with _runtime_lock:
-                    _runtime_state["initial_plan_completed"] += 1
 
         with _runtime_lock:
             _runtime_state["world_map"] = world_map
@@ -225,11 +273,13 @@ def generate_world() -> None:
             _runtime_state["error"] = ""
             _runtime_state["initial_plan_expected"] = 0
             _runtime_state["initial_plan_completed"] = 0
+            _runtime_state["paused"] = False
     except Exception as exc:  # noqa: BLE001
         with _runtime_lock:
             _runtime_state["ready"] = False
             _runtime_state["generating"] = False
             _runtime_state["error"] = str(exc)
+            _runtime_state["block_on_initial_plans"] = False
 
 
 def start_generation() -> None:
@@ -314,6 +364,21 @@ def get_world_snapshot() -> dict:
     actor_data = []
     for actor in world_map.actors:
         viewport = get_visible_tiles_and_actors(world_map, actor, vision_range=10)
+        visible_tile_set = set(viewport.visible_tiles)
+        visible_items = [
+            {
+                "item_id": gi.item.id,
+                "item_name": gi.item.name,
+                "quantity": gi.item.quantity,
+                "base_price": gi.item.base_price,
+                "x": gi.x,
+                "y": gi.y,
+                "owner_id": gi.owner_id,
+                "owner_role": next((a.role.value for a in world_map.actors if a.id == gi.owner_id), None),
+            }
+            for gi in world_map.world_items
+            if (gi.x, gi.y) in visible_tile_set
+        ]
         
         # Find path to a target for demo (e.g., first visible actor).
         path = None
@@ -337,9 +402,10 @@ def get_world_snapshot() -> dict:
             "hp": actor.hp,
             "visible_tiles": list(viewport.visible_tiles),
             "visible_actors": [
-                {"id": a.id, "name": a.name, "x": a.x, "y": a.y}
+                {"id": a.id, "name": a.name, "role": a.role.value, "x": a.x, "y": a.y}
                 for a in viewport.visible_actors
             ],
+            "visible_items": visible_items,
             "path": path,
         })
     

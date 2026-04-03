@@ -94,6 +94,8 @@ def test_shelf_item_visible_in_observation():
 
     assert "Health Potion" in output, f"Expected shelf item in observation:\n{output}"
     assert "potion_health" in output, f"Expected item id in observation:\n{output}"
+    assert "[shopkeeper]" in output.lower(), f"Expected visible actor role in observation:\n{output}"
+    assert "owned by" in output.lower(), f"Expected item ownership annotation in observation:\n{output}"
     assert "carrying/selling" in output, f"Expected carrying/selling label:\n{output}"
     print("PASS  test_shelf_item_visible_in_observation")
     return output

@@ -126,6 +126,7 @@ class SimulationEngine:
 		self._plan_last_completed_tick: dict[str, int] = {}
 		self._plan_failure_cooldown_until: dict[str, int] = {}
 		self._conversation_packets: dict[str, ConversationPacket] = {}
+		self._last_reflex_event: dict[str, tuple[str, int]] = {}
 		# Separate executor for conversation packet generation so it never blocks tick().
 		self._conversation_executor = ThreadPoolExecutor(max_workers=2)
 		# Keyed by listener (target) actor id → in-flight Future.
@@ -450,6 +451,12 @@ class SimulationEngine:
 				desc,
 				{"offender_id": offender.id, "crime": crime_type, "damage": damage, "hp": offender.hp},
 			)
+			self._log_event(
+				guard.id,
+				"combat",
+				desc,
+				{"target_id": offender.id, "damage": damage, "hp": offender.hp, "source": "guard_assault"},
+			)
 			offender.infamy = max(0, offender.infamy - max(1, severity // 2))
 			self._adjust_likeness(guard, offender.id, -severity * 2)
 			return
@@ -466,6 +473,12 @@ class SimulationEngine:
 			"guard_lethal",
 			desc,
 			{"offender_id": offender.id, "crime": crime_type, "damage": damage, "hp": offender.hp},
+		)
+		self._log_event(
+			guard.id,
+			"combat",
+			desc,
+			{"target_id": offender.id, "damage": damage, "hp": offender.hp, "source": "guard_lethal"},
 		)
 		self._adjust_likeness(guard, offender.id, -severity * 3)
 		if offender.hp == 0:
@@ -746,6 +759,17 @@ class SimulationEngine:
 		"""
 		from src.agents.prompts import CONVERSATION_RANGE
 
+		def _log_reflex_once(description: str, data: dict) -> str:
+			"""Suppress identical reflex logs for a few ticks to avoid event spam."""
+			last = self._last_reflex_event.get(actor.id)
+			if last is not None:
+				last_desc, last_tick = last
+				if last_desc == description and (self.tick_count - last_tick) < 5:
+					return description
+			self._log_event(actor.id, "reflex_action", description, data)
+			self._last_reflex_event[actor.id] = (description, self.tick_count)
+			return description
+
 		# Prefer trade-range adjacency (≤2 tiles) — actor is in position and holding
 		for other in self.world_map.actors:
 			if other.id == actor.id:
@@ -753,11 +777,10 @@ class SimulationEngine:
 			dist = physics.distance_chebyshev(actor.x, actor.y, other.x, other.y)
 			if dist <= 2:
 				desc = f"{actor.name} stands ready near {other.name}, waiting for a plan"
-				self._log_event(
-					actor.id, "reflex_action", desc,
+				return _log_reflex_once(
+					desc,
 					{"nearby_actor": other.id, "dist": dist, "context": "trade_range"},
 				)
-				return desc
 
 		# Acknowledge nearby actors within conversation range (≤8 tiles)
 		for other in self.world_map.actors:
@@ -766,16 +789,14 @@ class SimulationEngine:
 			dist = physics.distance_chebyshev(actor.x, actor.y, other.x, other.y)
 			if dist <= CONVERSATION_RANGE:
 				desc = f"{actor.name} watches {other.name} nearby while gathering thoughts"
-				self._log_event(
-					actor.id, "reflex_action", desc,
+				return _log_reflex_once(
+					desc,
 					{"nearby_actor": other.id, "dist": dist, "context": "conversation_range"},
 				)
-				return desc
 
 		# Default: hold position and observe surroundings
 		desc = f"{actor.name} pauses and observes their surroundings"
-		self._log_event(actor.id, "reflex_action", desc, {"context": "idle"})
-		return desc
+		return _log_reflex_once(desc, {"context": "idle"})
 
 	def _execute_action(self, actor: Actor, action: PlannedAction) -> str:
 		"""Execute one planned action step. Returns a description of what happened.
@@ -1127,6 +1148,13 @@ class SimulationEngine:
 			"damage": damage,
 			"is_crit": is_crit,
 			"target_hp": target.hp,
+		})
+		self._log_event(actor.id, "combat", desc, {
+			"target_id": target.id,
+			"damage": damage,
+			"is_crit": is_crit,
+			"target_hp": target.hp,
+			"source": "attack",
 		})
 
 		if target.hp == 0:

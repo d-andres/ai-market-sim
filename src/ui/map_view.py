@@ -115,7 +115,7 @@ def render_map_view(*, ascii_map: str, width: int, height: int):
                 )
 
         with ui.element("div").props(f'id={viewport_id}').classes("w-full").style(
-            "overflow:auto;min-height:520px;max-height:82vh;cursor:grab;"
+            "overflow:auto;min-height:500px;max-height:78vh;cursor:grab;"
             "background:#000000;border-top:1px solid #181818;border-bottom:1px solid #181818;"
         ):
             map_image = ui.image(svg_uri).props(f'id={image_id}').classes("block").style(

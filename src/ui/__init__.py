@@ -1,6 +1,7 @@
 """NiceGUI user interface components and page registration."""
 
 from collections.abc import Callable
+import html
 import json
 
 from fastapi import Request
@@ -79,6 +80,7 @@ def register_pages(
 				"generating": False,
 				"error": "",
 				"awaiting_responses": 0,
+				"block_on_initial_plans": True,
 			}
 
 			ui.label("AI MARKET SIM").classes("sim-title")
@@ -114,8 +116,12 @@ def register_pages(
 						ui.run_javascript("window.location.reload()")
 						return
 					if latest.get("generating"):
-						status_label.set_text("Loading... generating map, populating actors, and requesting initial plans.")
-						progress_label.set_text(f"Awaiting {latest.get('awaiting_responses', 0)} AI responses")
+						if latest.get("block_on_initial_plans"):
+							status_label.set_text("Loading... generating map, populating actors, and requesting initial plans.")
+							progress_label.set_text(f"Awaiting {latest.get('awaiting_responses', 0)} AI responses")
+						else:
+							status_label.set_text("Loading... generating map and populating actors.")
+							progress_label.set_text("Initial AI planning will continue during live ticks.")
 						if generate_button["el"] is not None:
 							generate_button["el"].props("disable")
 					else:
@@ -125,24 +131,6 @@ def register_pages(
 
 				_refresh_generation_status()
 				ui.timer(1.0, _refresh_generation_status)
-
-			# ── Static map preview (visible before generation completes) ──────
-			try:
-				from data.map import build_default_map
-				from data.map import render_ascii as _render_ascii
-				_preview_map = build_default_map()
-				_preview_ascii = _render_ascii(_preview_map, show_actors=False)
-				ui.label("MAP PREVIEW").style(
-					"font-family:'VT323',monospace;font-size:1.1rem;color:#555;"
-					"letter-spacing:0.1em;margin-top:12px;"
-				)
-				render_map_view(
-					ascii_map=_preview_ascii,
-					width=_preview_map.width,
-					height=_preview_map.height,
-				)
-			except Exception:
-				pass
 
 			return
 
@@ -213,13 +201,96 @@ def register_pages(
 		# ── Event log ─────────────────────────────────────────────────────────
 		with ui.card().classes("w-full mt-3"):
 			ui.label("EVENT LOG").classes("sim-section-title")
-			event_log = ui.log(max_lines=500).classes("w-full").style(
-				"height:300px;background:#080808 !important;color:#4caf50 !important;"
-				"font-family:'VT323',monospace !important;font-size:1.1rem !important;"
+			event_log_id = "event-log"
+			event_log = ui.column().props(f"id={event_log_id}").classes("w-full gap-0").style(
+				"height:300px;overflow:auto;background:#080808;border:1px solid #1d1d1d;padding:6px;"
 			)
-			for e in world_state.get("recent_events", []):
-				event_log.push(f"[{e['tick']:03d}] {e['actor_id']}: {e['description']}")
-			last_event_count = {"n": len(world_state.get("recent_events", []))}
+
+			def _event_color(event_type: str) -> str:
+				et = event_type.lower()
+				if et in {"attack", "combat", "guard_assault", "guard_lethal", "death"}:
+					return "#ff6b6b"
+				if et in {"crime", "steal", "report_theft", "guard_warning", "guard_fine"}:
+					return "#ffa94d"
+				if et in {"trade_accepted", "propose_trade"}:
+					return "#4ecdc4"
+				if et in {"trade_declined", "dialogue_suspicion"}:
+					return "#f3c969"
+				if et in {"converse"}:
+					return "#8ecae6"
+				if et in {"pick_up", "place", "equip", "unequip", "use_item"}:
+					return "#a0e8af"
+				if et in {"error", "interrupt", "plan_discarded_stale"}:
+					return "#ff8787"
+				if et in {"plan", "plan_submitted", "init"}:
+					return "#b197fc"
+				if et in {"move", "wait", "reflex_action"}:
+					return "#74c0fc"
+				return "#4caf50"
+
+			def _compress_events(events: list[dict]) -> list[dict]:
+				"""Suppress repeated wait/reflex lines when an actor repeats the same action next tick."""
+				dedupe_types = {"wait", "reflex_action"}
+				last_by_actor: dict[str, dict] = {}
+				out: list[dict] = []
+				for e in events:
+					actor_id = str(e.get("actor_id", ""))
+					etype = str(e.get("event_type", ""))
+					desc = str(e.get("description", ""))
+					tick = int(e.get("tick", 0))
+
+					last = last_by_actor.get(actor_id)
+					if (
+						etype in dedupe_types
+						and last is not None
+						and last.get("event_type") == etype
+						and last.get("description") == desc
+						and tick == int(last.get("tick", -9999)) + 1
+					):
+						last_by_actor[actor_id] = {
+							"event_type": etype,
+							"description": desc,
+							"tick": tick,
+						}
+						continue
+
+					out.append(e)
+					last_by_actor[actor_id] = {
+						"event_type": etype,
+						"description": desc,
+						"tick": tick,
+					}
+				return out
+
+			def _render_event_log(events: list[dict]) -> None:
+				event_log.clear()
+				filtered = _compress_events(events)[-500:]
+				with event_log:
+					for e in filtered:
+						etype = str(e.get("event_type", ""))
+						color = _event_color(etype)
+						tick = int(e.get("tick", 0))
+						actor_id = html.escape(str(e.get("actor_id", "?")))
+						desc = html.escape(str(e.get("description", "")))
+						etype_label = html.escape(etype.upper())
+						ui.html(
+							f'<div style="font-family:\'VT323\',monospace;font-size:1.1rem;line-height:1.3;white-space:pre-wrap;">'
+							f'<span style="color:#6a6a6a;">[{tick:03d}]</span> '
+							f'<span style="color:#8a8a8a;">{actor_id}</span> '
+							f'<span style="color:{color};">[{etype_label}]</span> '
+							f'<span style="color:{color};">{desc}</span>'
+							"</div>"
+						)
+				ui.run_javascript(
+					f"""
+					(() => {{
+						const el = document.getElementById('{event_log_id}');
+						if (el) el.scrollTop = el.scrollHeight;
+					}})();
+					"""
+				)
+
+			_render_event_log(world_state.get("recent_events", []))
 
 		def refresh_map() -> None:
 			snapshot = get_world_snapshot()
@@ -242,11 +313,8 @@ def register_pages(
 			btn = _play_btn["el"]
 			if btn is not None and is_paused is not None:
 				btn.set_text("▶ PLAY" if is_paused() else "⏸ PAUSE")
-			# Push only new events — ui.log auto-scrolls to the bottom
-			events = snapshot.get("recent_events", [])
-			for e in events[last_event_count["n"]:]:
-				event_log.push(f"[{e['tick']:03d}] {e['actor_id']}: {e['description']}")
-			last_event_count["n"] = len(events)
+			# Re-render filtered/colorized events each refresh.
+			_render_event_log(snapshot.get("recent_events", []))
 
 		# ── State inspector ────────────────────────────────────────────────────
 		with ui.card().classes("w-full mt-3"):

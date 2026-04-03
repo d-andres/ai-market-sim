@@ -19,18 +19,33 @@ from typing import TYPE_CHECKING
 
 from smolagents import Tool, LiteLLMModel, ChatMessage, MessageRole
 
-from src.models.schema import Actor, Map, PlannedAction, TradeProposal
+from src.models.schema import Actor, ActorRole, Map, PlannedAction, TradeProposal
 from src.simulation import physics
 from src.agents.prompts import (
 	TRADE_EVALUATION_PROMPT,
 	CONVERSATION_RANGE,
 	DIALOGUE_SOCIAL_IMPACT_PROMPT,
+	ADAPTIVE_FALLBACK_POLICY_PROMPT,
+	ADAPTIVE_FALLBACK_PLAN_PROMPT,
 	get_system_prompt_for_role,
 )
-from src.agents.response_parser import parse_plan, parse_trade_decision
+from src.agents.response_parser import clean, parse_plan, parse_trade_decision
 
 if TYPE_CHECKING:
 	from src.simulation.engine import SimulationEngine
+
+
+def _extract_json_object(raw: str) -> dict | None:
+	"""Extract and parse the first JSON object from model output."""
+	text = clean(raw)
+	match = re.search(r"\{[\s\S]*\}", text)
+	if not match:
+		return None
+	try:
+		parsed = json.loads(match.group(0))
+		return parsed if isinstance(parsed, dict) else None
+	except Exception:
+		return None
 
 
 # ---------------------------------------------------------------------------
@@ -241,6 +256,10 @@ class AgentBrain:
 
 	# How many steps the LLM is asked to plan at once.
 	PLAN_HORIZON: int = 30
+	# AI-authored fallback profile refresh cadence and fallback planning budget.
+	FALLBACK_POLICY_TTL_TICKS: int = 40
+	FALLBACK_PLAN_HORIZON: int = 10
+	FALLBACK_MAX_ATTEMPTS: int = 2
 
 	def __init__(
 		self,
@@ -260,8 +279,177 @@ class AgentBrain:
 		self.obs_tool = ObserveSurroundingsTool(
 			actor=actor, world_map=world_map, memory=self.memory, engine=engine
 		)
+		self._adaptive_fallback_policy: dict | None = None
+		self._adaptive_fallback_policy_tick: int = -10_000
 
-	def create_plan(self, interrupt_reason: str = "") -> tuple[list[PlannedAction], str]:
+	def _role_goal_directive(self) -> str:
+		"""Return the high-level role objective for strategic planning prompts."""
+		if self.actor.role == ActorRole.GUARD:
+			return "Maintain order, investigate suspicious behavior, and keep visible protective presence."
+		if self.actor.role == ActorRole.SHOPKEEPER:
+			return "Protect stock, engage customers, and optimize profitable trades without inviting danger."
+		return "Acquire high-value items and adapt tactics to risk, personality, and social consequences."
+
+	def _traits_text(self) -> str:
+		traits = getattr(self.actor, "personality_traits", None) or []
+		if not traits:
+			return "role-default"
+		return ", ".join(str(t).strip() for t in traits if str(t).strip())
+
+	def _is_low_quality_plan(self, plan: list[PlannedAction]) -> bool:
+		"""Treat all-wait or tiny mostly-idle plans as low quality."""
+		if not plan:
+			return True
+		non_wait = [a for a in plan if a.action_type != "wait"]
+		if not non_wait:
+			return True
+		if len(plan) >= 4 and len(non_wait) == 1 and all(a.action_type == "wait" for a in plan[:3]):
+			return True
+		return False
+
+	def _normalize_fallback_policy(self, raw_policy: dict | None, refresh_reason: str) -> dict:
+		"""Sanitize policy payload from model into a stable JSON structure."""
+		raw_policy = raw_policy or {}
+		identity_summary = str(raw_policy.get("identity_summary") or "").strip()
+		if not identity_summary:
+			identity_summary = f"{self.actor.name} acts according to role obligations and personal temperament."
+
+		goals = [
+			str(g).strip()
+			for g in (raw_policy.get("goals") or [])
+			if str(g).strip()
+		][:5]
+		if not goals:
+			goals = [self._role_goal_directive()]
+
+		preferred_tactics = [
+			str(t).strip()
+			for t in (raw_policy.get("preferred_tactics") or [])
+			if str(t).strip()
+		][:6]
+
+		revision_triggers = [
+			str(t).strip()
+			for t in (raw_policy.get("revision_triggers") or [])
+			if str(t).strip()
+		][:6]
+
+		risk_posture = str(raw_policy.get("risk_posture") or "medium").strip().lower()
+		if risk_posture not in {"low", "medium", "high"}:
+			risk_posture = "medium"
+
+		return {
+			"identity_summary": identity_summary,
+			"goals": goals,
+			"preferred_tactics": preferred_tactics,
+			"risk_posture": risk_posture,
+			"revision_triggers": revision_triggers,
+			"refresh_reason": refresh_reason,
+		}
+
+	def _refresh_adaptive_fallback_policy(self, observation: str, refresh_reason: str) -> None:
+		"""Ask the LLM to author/adjust a compact fallback strategy profile."""
+		recent_events = self.engine.get_event_log(limit=8)
+		recent_lines = [f"[tick {e['tick']}] {e['description']}" for e in recent_events]
+		prompt = ADAPTIVE_FALLBACK_POLICY_PROMPT.format(
+			actor_name=self.actor.name,
+			actor_role=self.actor.role.value,
+			traits=self._traits_text(),
+			role_goal=self._role_goal_directive(),
+			tick=self.engine.tick_count,
+			hp=self.actor.hp,
+			max_hp=self.actor.max_hp,
+			gold=self.actor.gold,
+			fame=self.actor.fame,
+			infamy=self.actor.infamy,
+			refresh_reason=refresh_reason,
+			recent_events="\n".join(recent_lines) if recent_lines else "(none)",
+			observation=observation,
+		)
+
+		messages = [
+			ChatMessage(role=MessageRole.SYSTEM, content=[{"type": "text", "text": self.system_prompt}]),
+			ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": prompt}]),
+		]
+
+		try:
+			response = self.model(messages)
+			raw = response.content if hasattr(response, "content") else str(response)
+			parsed = _extract_json_object(raw)
+			self._adaptive_fallback_policy = self._normalize_fallback_policy(parsed, refresh_reason)
+			self._adaptive_fallback_policy_tick = self.engine.tick_count
+		except Exception:
+			if self._adaptive_fallback_policy is None:
+				self._adaptive_fallback_policy = self._normalize_fallback_policy(None, refresh_reason)
+				self._adaptive_fallback_policy_tick = self.engine.tick_count
+
+	def _ensure_adaptive_fallback_policy(
+		self,
+		observation: str,
+		refresh_reason: str,
+		force_refresh: bool = False,
+	) -> None:
+		stale = (self.engine.tick_count - self._adaptive_fallback_policy_tick) >= self.FALLBACK_POLICY_TTL_TICKS
+		if force_refresh or self._adaptive_fallback_policy is None or stale:
+			self._refresh_adaptive_fallback_policy(observation, refresh_reason)
+
+	def _adaptive_fallback_plan(
+		self,
+		observation: str,
+		interrupt_reason: str,
+		failure_reason: str,
+	) -> tuple[list[PlannedAction], str]:
+		"""Generate a replacement plan using an AI-authored fallback policy."""
+		self._ensure_adaptive_fallback_policy(
+			observation,
+			failure_reason,
+			force_refresh=bool(interrupt_reason),
+		)
+
+		for attempt in range(self.FALLBACK_MAX_ATTEMPTS):
+			policy = self._adaptive_fallback_policy or self._normalize_fallback_policy(None, failure_reason)
+			prompt = ADAPTIVE_FALLBACK_PLAN_PROMPT.format(
+				actor_name=self.actor.name,
+				actor_role=self.actor.role.value,
+				traits=self._traits_text(),
+				tick=self.engine.tick_count,
+				horizon=self.FALLBACK_PLAN_HORIZON,
+				failure_reason=failure_reason,
+				interrupt_reason=interrupt_reason or "(none)",
+				policy_json=json.dumps(policy, ensure_ascii=True),
+				observation=observation,
+			)
+
+			messages = [
+				ChatMessage(role=MessageRole.SYSTEM, content=[{"type": "text", "text": self.system_prompt}]),
+				ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": prompt}]),
+			]
+
+			try:
+				response = self.model(messages)
+				content = response.content if hasattr(response, "content") else str(response)
+				plan, summary = parse_plan(content, self.actor.name)
+				if not self._is_low_quality_plan(plan):
+					return plan, f"{summary} (adaptive fallback)"
+			except Exception:
+				pass
+
+			if attempt + 1 < self.FALLBACK_MAX_ATTEMPTS:
+				self._ensure_adaptive_fallback_policy(
+					observation,
+					refresh_reason=f"retry_after_{failure_reason}",
+					force_refresh=True,
+				)
+
+		return [PlannedAction(action_type="wait", params={}, reason="adaptive fallback exhausted")], (
+			f"{self.actor.name} pauses briefly to reassess strategy."
+		)
+
+	def create_plan(
+		self,
+		interrupt_reason: str = "",
+		allow_adaptive_fallback: bool = True,
+	) -> tuple[list[PlannedAction], str]:
 		"""Call the LLM once to produce a list of planned actions and a thought summary.
 
 		Returns (plan, summary) where summary is a brief in-character description
@@ -279,12 +467,16 @@ class AgentBrain:
 				f"\n\n⚠️ INTERRUPT — your previous plan was cancelled because: {interrupt_reason}\n"
 				"Reassess the situation and form a new plan."
 			)
+		role_goal = self._role_goal_directive()
+		traits_text = self._traits_text()
 
 		user_msg = (
 			f"Tick {self.engine.tick_count} | HP: {self.actor.hp}/{self.actor.max_hp} | "
 			f"ATK: {self.actor.base_attack} | DEF: {self.actor.base_defense} | "
 			f"CRIT: {self.actor.base_crit:.0%} | "
-			f"Gold: {self.actor.gold}g | Fame: {self.actor.fame} | Infamy: {self.actor.infamy} | Carrying: {inv_summary}\n\n"
+			f"Gold: {self.actor.gold}g | Fame: {self.actor.fame} | Infamy: {self.actor.infamy} | Traits: {traits_text} | Carrying: {inv_summary}\n\n"
+			f"{role_goal}\n"
+			"Visible actor roles and item ownership labels in observation are authoritative ground truth.\n\n"
 			f"WORLD OBSERVATION:\n{observation}"
 			f"{interrupt_ctx}\n\n"
 			f"Create a plan of {self.PLAN_HORIZON} steps (fill all {self.PLAN_HORIZON} — do not stop early). "
@@ -323,13 +515,31 @@ class AgentBrain:
 			ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": user_msg}]),
 		]
 
-		_fallback_summary = f"{self.actor.name} pauses, unsure what to do next."
 		try:
 			response = self.model(messages)
 			content: str = response.content if hasattr(response, "content") else str(response)
-			return parse_plan(content, self.actor.name)
+			plan, summary = parse_plan(content, self.actor.name)
+			if self._is_low_quality_plan(plan):
+				if not allow_adaptive_fallback:
+					return [PlannedAction(action_type="wait", params={}, reason="initial warm-up fallback")], (
+						f"{self.actor.name} could not form a reliable initial plan and will adapt after simulation starts."
+					)
+				return self._adaptive_fallback_plan(
+					observation=observation,
+					interrupt_reason=interrupt_reason,
+					failure_reason="low_quality_or_idle_primary_plan",
+				)
+			return plan, summary
 		except Exception as e:
-			return [PlannedAction(action_type="wait", reason=f"Plan generation failed: {e}")], _fallback_summary
+			if not allow_adaptive_fallback:
+				return [PlannedAction(action_type="wait", params={}, reason=f"initial warm-up failed: {e}")], (
+					f"{self.actor.name} failed initial planning and will recover after startup."
+				)
+			return self._adaptive_fallback_plan(
+				observation=observation,
+				interrupt_reason=interrupt_reason,
+				failure_reason=f"primary_plan_generation_failed: {e}",
+			)
 
 	def evaluate_trade_proposal(
 		self,
@@ -511,7 +721,7 @@ def _parse_conversation_packet_response(raw: str, actor_name: str) -> tuple[str,
 
 def _parse_dialogue_social_impact_response(raw: str, candidates: list[dict]) -> dict:
 	"""Parse strict JSON from dialogue impact response and clamp values."""
-	text = raw.strip()
+	text = clean(raw)
 	match = re.search(r"\{.*\}", text, flags=re.DOTALL)
 	if match:
 		text = match.group(0)

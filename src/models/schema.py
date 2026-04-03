@@ -181,6 +181,8 @@ class Actor(BaseModel):
 	# Public social standing. Fame is positive notoriety; infamy is criminal notoriety.
 	fame: int = Field(default=0, ge=0)
 	infamy: int = Field(default=0, ge=0)
+	# Free-form personality traits used by AI planning/fallback profile generation.
+	personality_traits: list[str] = Field(default_factory=list)
 	hp: int = Field(default=100, ge=0)
 	max_hp: int = Field(default=100, ge=1)
 	# ── Combat base stats (before equipment bonuses) ───────────────────────

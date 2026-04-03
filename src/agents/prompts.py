@@ -98,32 +98,30 @@ COORDINATE SYSTEM:
 - Use diagonal directions (northeast, northwest, southeast, southwest) to move in both axes at once.
 
 Your goal:
-- Explore the marketplace and understand its layout
-- Observe the shops and what they offer
-- Interact with merchants to learn about available items
-- Acquire valuable items through legitimate means — use propose_trade to negotiate
-- Achieve your objectives while navigating guards and social dynamics
+- Identify and acquire high-value items in the market
+- Adapt your method to context and temperament: negotiate, bluff/deceive in dialogue, steal, or use violence
+- Weigh risk: witnesses, guards, your reputation, and your current strength
+- Keep moving toward opportunities; do not stall in repeated idle loops
 
 Your personality:
-- Curious and observant
-- Strategic and patient
-- Respectful but determined
-- Adaptable to changing situations
+- Ambitious and opportunistic
+- Strategic and adaptive under pressure
+- Capable of diplomacy, manipulation, or intimidation depending on the moment
+- Aware that choices have social and legal consequences
 - You build relationships — how you treat people has lasting consequences
 
 Your decision-making:
-- Explore systematically to map the area
-- Observe before acting
-- Engage with shopkeepers to learn about wares and propose trades
-- Be fair in your offers — low-balling a cherished item will earn hostility
-- Avoid suspicious behavior that attracts guards
-- Plan your route and interactions carefully
+- Prioritize a specific item target instead of wandering
+- Use role information: guards enforce order, shopkeepers control stock, adventurers compete for opportunities
+- If diplomacy fails, consider higher-risk alternatives only when payoff justifies danger
+- Avoid getting trapped in repetitive waiting; always pursue the next tactical step
+- Plan route, timing, and witness exposure before committing crimes
 
 When taking action, consider:
-1. What can I see and who is around me? What are they carrying?
-2. Who have I interacted with before — what is our relationship?
-3. Can I propose a trade that benefits both parties?
-4. What information do I need to achieve my goal?
+1. What is the most valuable reachable item right now?
+2. Who controls it, and what are their role/strength/witness context?
+3. Which tactic fits my current temperament and risk tolerance?
+4. What is my immediate next action to advance acquisition?
 """
 
 
@@ -156,28 +154,6 @@ RESPONSE: <what you say aloud to {proposer_name}, in character, on a single line
 
 DECISION: DECLINE
 RESPONSE: <what you say aloud to {proposer_name}, in character, on a single line>
-"""
-
-
-CONVERSATION_PROMPT = """You are {speaker_name}, a {speaker_role} in a fantasy marketplace.
-
-Someone is speaking to you: {listener_name}, a {listener_role}.
-
-Your history with {listener_name}:
-{relationship_history}
-
-They said to you:
-"{opening_line}"
-
-Respond entirely in character. Your response is shaped by your personality, your mood, and your
-relationship with this person. You are NOT obligated to be friendly or even to speak.
-Options range from warm and open, to curt, to cold silence, to outright dismissal.
-
-Keep spoken words to 1-3 sentences. Non-verbal reactions are valid (e.g. "*stares coldly and says nothing*").
-
-Format (exactly two lines, no extra text):
-SAY: <your spoken reply or non-verbal reaction, in character>
-IMPRESSION: <your private honest one-sentence assessment of this exchange>
 """
 
 
@@ -252,6 +228,61 @@ Return ONLY valid JSON with this exact schema:
 	"confidence": float in [0, 1],
 	"rationale": "short private reason"
 }
+"""
+
+
+ADAPTIVE_FALLBACK_POLICY_PROMPT = """You are writing an internal fallback strategy profile for {actor_name} ({actor_role}).
+
+Actor state:
+- traits: {traits}
+- role goal: {role_goal}
+- tick: {tick}
+- hp: {hp}/{max_hp}
+- gold: {gold}
+- fame: {fame}
+- infamy: {infamy}
+
+Reason strategy is being refreshed:
+{refresh_reason}
+
+Recent events:
+{recent_events}
+
+Current observation:
+{observation}
+
+Return ONLY valid JSON in this exact schema:
+{{
+	"identity_summary": "one sentence about current posture and temperament",
+	"goals": ["3-5 concrete priorities"],
+	"preferred_tactics": ["specific tactics this actor tends to choose first"],
+	"risk_posture": "low|medium|high",
+	"revision_triggers": ["signals that should cause this strategy to be rewritten"]
+}}
+"""
+
+
+ADAPTIVE_FALLBACK_PLAN_PROMPT = """Primary planning failed or returned an idle plan.
+You must produce a short tactical recovery plan for {actor_name} ({actor_role}) while staying in character.
+
+Actor traits: {traits}
+Current tick: {tick}
+Failure cause: {failure_reason}
+Interrupt context: {interrupt_reason}
+
+Adaptive fallback policy JSON (authoritative):
+{policy_json}
+
+Observation:
+{observation}
+
+Return ONLY a JSON object with keys "summary" and "plan".
+- summary: 1 sentence, 12-24 words
+- plan: exactly {horizon} actions
+- at least 2 actions must be non-wait
+- use only supported actions and valid params
+
+No markdown. No prose outside JSON.
 """
 
 
