@@ -11,6 +11,8 @@ Phase 3: AI agents control all actor behavior via LLM reasoning.
 
 from __future__ import annotations
 
+import time
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -56,6 +58,17 @@ PLAN_FAILURE_COOLDOWN_TICKS: int = 15
 
 # Hard cap on simultaneous in-flight LLM planning requests.
 MAX_CONCURRENT_PLAN_JOBS: int = 10
+
+# Maximum ticks a plan future can be pending before we abandon it.
+# At 2s/tick this equals ~300 seconds (5 minutes).
+# create_plan can cascade into up to 3 sequential LLM calls (primary + policy + fallback),
+# each with a 180s litellm timeout, so this must be generous.
+PLAN_TIMEOUT_TICKS: int = 150
+
+# After a timeout, cooldown ticks before replanning (applied when health check passes).
+# If health check fails, this is doubled.
+TIMEOUT_REPLAN_COOLDOWN_TICKS: int = 10
+TIMEOUT_UNHEALTHY_COOLDOWN_TICKS: int = 45
 
 # Social/crime mechanics
 WITNESS_VISION_RANGE: int = 10
@@ -115,10 +128,15 @@ class SimulationEngine:
 		self.events: list[SimulationEvent] = []
 		self.enable_ai = enable_ai
 		self.llm_call_count: int = 0  # total LLM planning calls made
+		self.llm_response_count: int = 0  # successful LLM responses received
+		self.llm_timeout_count: int = 0  # LLM requests that timed out
+		self.llm_total_duration: float = 0.0  # cumulative seconds spent in LLM calls
 		self.llm_pending_actors: list[str] = []  # actor names currently waiting on LLM
-		self._plan_executor = ThreadPoolExecutor(max_workers=max(1, len(self.world_map.actors)))
+		self.llm_request_log: deque[dict] = deque(maxlen=50)  # recent request/response pairs
+		self._plan_executor = ThreadPoolExecutor(max_workers=max(2, len(self.world_map.actors) * 2))
 		self._pending_plan_futures: dict[str, Future] = {}
 		self._pending_plan_started_tick: dict[str, int] = {}
+		self._pending_plan_started_time: dict[str, float] = {}  # wall-clock start time
 		self._plan_generation: dict[str, int] = {a.id: 0 for a in self.world_map.actors}
 		self._pending_plan_generation: dict[str, int] = {}
 		self.stale_plan_discard_count: int = 0
@@ -131,6 +149,8 @@ class SimulationEngine:
 		self._conversation_executor = ThreadPoolExecutor(max_workers=2)
 		# Keyed by listener (target) actor id → in-flight Future.
 		self._pending_packet_futures: dict[str, Future] = {}
+		# Health check futures submitted after plan timeouts.
+		self._pending_health_checks: dict[str, Future] = {}  # actor_id → Future[tuple[bool,str]]
 		# Combat and social tracking for crime/self-defense logic.
 		self._last_attack_tick: dict[tuple[str, str], int] = {}  # (attacker_id, victim_id) -> tick
 		self._suspicion: dict[tuple[str, str], int] = {}  # (accuser_id, suspect_id) -> score
@@ -563,6 +583,7 @@ class SimulationEngine:
 		future = self._plan_executor.submit(brain.create_plan, interrupt_reason)
 		self._pending_plan_futures[actor.id] = future
 		self._pending_plan_started_tick[actor.id] = self.tick_count
+		self._pending_plan_started_time[actor.id] = time.monotonic()
 		self._pending_plan_generation[actor.id] = generation
 		self.llm_call_count += 1
 		self._log_event(
@@ -574,6 +595,45 @@ class SimulationEngine:
 
 	def _collect_completed_plan_requests(self, updates: dict) -> None:
 		"""Apply completed planning jobs without blocking the current tick."""
+		# Watchdog: abandon futures that have been pending too long.
+		for actor_id, future in list(self._pending_plan_futures.items()):
+			started = self._pending_plan_started_tick.get(actor_id, self.tick_count)
+			if not future.done() and (self.tick_count - started) >= PLAN_TIMEOUT_TICKS:
+				future.cancel()
+				duration = time.monotonic() - self._pending_plan_started_time.get(actor_id, time.monotonic())
+				self.llm_timeout_count += 1
+				self.llm_total_duration += duration
+				actor = self._actor_by_id(actor_id)
+				actor_name = actor.name if actor else actor_id
+				brain = self.agent_brains.get(actor_id)
+				request_text = brain.last_request_prompt if brain else "(plan request)"
+				if actor:
+					actor.needs_replan = True
+					actor.interrupt_reason = "previous plan request timed out — health check pending"
+					self._log_event(
+						actor_id=actor_id,
+						event_type="error",
+						description=f"{actor.name} plan request timed out after {PLAN_TIMEOUT_TICKS} ticks — running health check",
+						data={"started_tick": started, "current_tick": self.tick_count},
+					)
+				self.llm_request_log.append({
+					"tick": self.tick_count,
+					"actor": actor_name,
+					"status": "timeout",
+					"duration": round(duration, 2),
+					"request": request_text,
+					"response": f"Timed out after {PLAN_TIMEOUT_TICKS} ticks — health check submitted",
+				})
+				self._pending_plan_futures.pop(actor_id, None)
+				self._pending_plan_started_tick.pop(actor_id, None)
+				self._pending_plan_started_time.pop(actor_id, None)
+				self._pending_plan_generation.pop(actor_id, None)
+				# Submit a lightweight health check to verify LLM is still alive.
+				if brain and actor_id not in self._pending_health_checks:
+					hc_future = self._plan_executor.submit(brain.health_check)
+					self._pending_health_checks[actor_id] = hc_future
+				continue
+
 		for actor_id, future in list(self._pending_plan_futures.items()):
 			if not future.done():
 				continue
@@ -582,6 +642,7 @@ class SimulationEngine:
 			if actor is None:
 				self._pending_plan_futures.pop(actor_id, None)
 				self._pending_plan_started_tick.pop(actor_id, None)
+				self._pending_plan_started_time.pop(actor_id, None)
 				self._pending_plan_generation.pop(actor_id, None)
 				continue
 
@@ -601,11 +662,16 @@ class SimulationEngine:
 				)
 				self._pending_plan_futures.pop(actor_id, None)
 				self._pending_plan_started_tick.pop(actor_id, None)
+				self._pending_plan_started_time.pop(actor_id, None)
 				self._pending_plan_generation.pop(actor_id, None)
 				continue
 
+			duration = time.monotonic() - self._pending_plan_started_time.get(actor_id, time.monotonic())
+			self.llm_total_duration += duration
+
 			try:
 				plan, thought_summary = future.result()
+				self.llm_response_count += 1
 				actor.action_queue = plan
 				actor.needs_replan = False
 				actor.interrupt_reason = ""
@@ -622,6 +688,15 @@ class SimulationEngine:
 					"actor_name": actor.name,
 					"summary": thought_summary,
 				})
+				brain = self.agent_brains.get(actor_id)
+				self.llm_request_log.append({
+					"tick": self.tick_count,
+					"actor": actor.name,
+					"status": "ok",
+					"duration": round(duration, 2),
+					"request": brain.last_request_prompt if brain else "(plan request)",
+					"response": brain.last_response_raw if brain else thought_summary,
+				})
 			except Exception as e:
 				self._log_event(
 					actor_id=actor.id,
@@ -632,10 +707,73 @@ class SimulationEngine:
 				actor.action_queue = []
 				actor.needs_replan = True
 				self._plan_failure_cooldown_until[actor_id] = self.tick_count + PLAN_FAILURE_COOLDOWN_TICKS
+				brain = self.agent_brains.get(actor_id)
+				self.llm_request_log.append({
+					"tick": self.tick_count,
+					"actor": actor.name,
+					"status": "error",
+					"duration": round(duration, 2),
+					"request": brain.last_request_prompt if brain else "(plan request)",
+					"response": str(e),
+				})
 
 			self._pending_plan_futures.pop(actor_id, None)
 			self._pending_plan_started_tick.pop(actor_id, None)
+			self._pending_plan_started_time.pop(actor_id, None)
 			self._pending_plan_generation.pop(actor_id, None)
+
+	def _collect_health_check_results(self) -> None:
+		"""Process completed LLM health checks submitted after plan timeouts."""
+		for actor_id, future in list(self._pending_health_checks.items()):
+			if not future.done():
+				continue
+
+			actor = self._actor_by_id(actor_id)
+			actor_name = actor.name if actor else actor_id
+
+			try:
+				alive, detail = future.result()
+			except Exception as e:
+				alive, detail = False, str(e)[:200]
+
+			if alive:
+				cooldown = TIMEOUT_REPLAN_COOLDOWN_TICKS
+				self._log_event(
+					actor_id=actor_id,
+					event_type="init",
+					description=f"LLM health check passed for {actor_name} — resuming normal planning",
+					data={"response": detail},
+				)
+				self.llm_request_log.append({
+					"tick": self.tick_count,
+					"actor": actor_name,
+					"status": "ok",
+					"duration": 0,
+					"request": "Health check: Respond with exactly: OK",
+					"response": detail,
+				})
+			else:
+				cooldown = TIMEOUT_UNHEALTHY_COOLDOWN_TICKS
+				self._log_event(
+					actor_id=actor_id,
+					event_type="error",
+					description=f"LLM health check FAILED for {actor_name} — extended cooldown ({cooldown} ticks)",
+					data={"error": detail},
+				)
+				self.llm_request_log.append({
+					"tick": self.tick_count,
+					"actor": actor_name,
+					"status": "error",
+					"duration": 0,
+					"request": "Health check: Respond with exactly: OK",
+					"response": f"FAILED: {detail}",
+				})
+
+			if actor:
+				actor.needs_replan = True
+				actor.interrupt_reason = "recovery after health check"
+			self._plan_failure_cooldown_until[actor_id] = self.tick_count + cooldown
+			self._pending_health_checks.pop(actor_id, None)
 
 	def tick(self) -> dict:
 		"""Execute one simulation tick.
@@ -653,6 +791,8 @@ class SimulationEngine:
 		if self.enable_ai:
 			# Apply any plan jobs that completed since previous tick(s), without blocking.
 			self._collect_completed_plan_requests(updates)
+			# Process LLM health checks (submitted after timeouts).
+			self._collect_health_check_results()
 
 			# Submit new plan requests in priority order, respecting cadence/cooldown/cap.
 			# Priority 0 = critical interrupt (needs_replan + interrupt_reason) → always immediate
@@ -662,6 +802,7 @@ class SimulationEngine:
 				a for a in self.world_map.actors
 				if (a.needs_replan or not a.action_queue)
 				and a.id not in self._pending_plan_futures
+				and a.id not in self._pending_health_checks
 				and self.agent_brains.get(a.id)
 				and self._plan_failure_cooldown_until.get(a.id, 0) <= self.tick_count
 			]
