@@ -4,13 +4,15 @@ from nicegui import ui
 
 # Colour palette per tile/actor symbol
 _COLOURS: dict[str, str] = {
-    "#": "#6c6c6c",   # wall  — dim grey
-    ".": "#1e1e1e",   # floor — near-black (subtle grid)
+    "#": "#555555",   # wall  — mid grey
+    ".": "#3a3a3a",   # floor — visible dark grey
     "S": "#ffd700",   # shop  — gold
     "E": "#00e5ff",   # entrance — cyan
     "G": "#ff4444",   # guard — red
     "K": "#44ff88",   # shopkeeper — green
     "@": "#ffffff",   # player — bright white
+    "s": "#ffaa00",   # stocked shelf item — amber
+    "i": "#bb88ff",   # floor item — lavender
 }
 _DEFAULT_COLOUR = "#888888"
 
@@ -37,10 +39,9 @@ def _map_to_html(ascii_map: str) -> str:
 
 def render_map_view(*, ascii_map: str, width: int, height: int):
     """Render the world map and return the html element for live refreshes."""
-    with ui.card().classes("w-full").style("background:#000;border:1px solid #333;"):
-        with ui.row().classes("items-center justify-between w-full"):
-            ui.label("World Map").classes("text-xl font-bold").style("color:#ffd700")
-            ui.label(f"{width} x {height}").style("color:#555;font-family:'VT323',monospace;font-size:1rem")
+    with ui.card().classes("w-full").style("background:#000;border:1px solid #222;"):
+        with ui.row().classes("items-center justify-end w-full"):
+            ui.label(f"{width} x {height}").style("color:#333;font-family:'VT323',monospace;font-size:1rem")
 
         with ui.element("div").classes("w-full flex justify-center"):
             map_html = ui.html(_map_to_html(ascii_map))
@@ -48,13 +49,15 @@ def render_map_view(*, ascii_map: str, width: int, height: int):
         # Colour-coded legend
         with ui.row().classes("gap-3 flex-wrap").style("font-family:'VT323',monospace;font-size:1rem"):
             for symbol, colour, label in [
-                ("#", "#6c6c6c", "Wall"),
-                (".", "#555",    "Floor"),
+                ("#", "#555555", "Wall"),
+                (".", "#3a3a3a",  "Floor"),
                 ("S", "#ffd700", "Shop"),
                 ("E", "#00e5ff", "Entrance"),
                 ("G", "#ff4444", "Guard"),
                 ("K", "#44ff88", "Shopkeeper"),
                 ("@", "#ffffff", "Player"),
+                ("s", "#ffaa00", "Shelf item"),
+                ("i", "#bb88ff", "Floor item"),
             ]:
                 ui.label(f"{symbol} {label}").style(f"color:{colour}")
 

@@ -12,6 +12,34 @@ _PAGE_CSS = """
 <link href="https://fonts.googleapis.com/css2?family=VT323&display=swap" rel="stylesheet">
 <style>
   body, .nicegui-content, .q-page { background:#080808 !important; }
+  .sim-title {
+    font-family:'VT323',monospace;
+    font-size:2.6rem;
+    letter-spacing:0.15em;
+    background: linear-gradient(90deg, #ff6ec7, #ff9d00, #ffe600, #39ff14, #00e5ff, #bf5fff);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    filter: drop-shadow(0 0 8px rgba(180,100,255,0.25));
+  }
+  .sim-section-title {
+    font-family:'VT323',monospace;
+    font-size:1.4rem;
+    letter-spacing:0.1em;
+    background: linear-gradient(90deg, #ff9d00, #ffe600, #39ff14, #00e5ff);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+  .sim-page-title {
+    font-family:'VT323',monospace;
+    font-size:1.6rem;
+    letter-spacing:0.1em;
+    background: linear-gradient(90deg, #ff6ec7, #ff9d00, #ffe600, #39ff14);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
   .q-card { background:#111111 !important; border:1px solid #252525 !important; box-shadow:none !important; }
   .q-expansion-item__container, .q-expansion-item .q-item { background:#111111 !important; color:#7a7a7a !important; }
   .q-expansion-item__content { background:#0c0c0c !important; }
@@ -41,7 +69,7 @@ def register_pages(
 ) -> None:
 	"""Register NiceGUI pages for the application."""
 
-	@ui.page("/")
+	@ui.page("/", title="AI Market Sim", favicon="🏪")
 	def dashboard(request: Request) -> None:
 		ui.add_head_html(_PAGE_CSS)
 
@@ -53,13 +81,9 @@ def register_pages(
 				"awaiting_responses": 0,
 			}
 
-			ui.label("⚔  AI MARKET SIM  ⚔").style(
-				"font-family:'VT323',monospace;font-size:2.6rem;color:#d4a017;letter-spacing:0.15em;"
-			)
+			ui.label("AI MARKET SIM").classes("sim-title")
 			with ui.card().classes("w-full max-w-2xl"):
-				ui.label("WORLD INITIALIZATION").style(
-					"font-family:'VT323',monospace;font-size:1.6rem;color:#d4a017;letter-spacing:0.1em"
-				)
+				ui.label("WORLD INITIALIZATION").classes("sim-page-title")
 				status_label = ui.label("").style(
 					"font-family:'VT323',monospace;font-size:1.1rem;color:#7a7a7a;"
 				)
@@ -104,9 +128,7 @@ def register_pages(
 
 			return
 
-		ui.label("⚔  AI MARKET SIM  ⚔").style(
-			"font-family:'VT323',monospace;font-size:2.6rem;color:#d4a017;letter-spacing:0.15em;"
-		)
+		ui.label("AI MARKET SIM").classes("sim-title")
 		ui.label("Autonomous agent marketplace simulation").style(
 			"font-family:'VT323',monospace;font-size:1.05rem;color:#444;letter-spacing:0.06em;"
 		)
@@ -172,9 +194,7 @@ def register_pages(
 
 		# ── Event log ─────────────────────────────────────────────────────────
 		with ui.card().classes("w-full mt-3"):
-			ui.label("EVENT LOG").style(
-				"font-family:'VT323',monospace;font-size:1.4rem;color:#d4a017;letter-spacing:0.1em"
-			)
+			ui.label("EVENT LOG").classes("sim-section-title")
 			event_log = ui.log(max_lines=500).classes("w-full").style(
 				"height:300px;background:#080808 !important;color:#4caf50 !important;"
 				"font-family:'VT323',monospace !important;font-size:1.1rem !important;"
@@ -219,9 +239,7 @@ def register_pages(
 
 		# ── Physics debug ──────────────────────────────────────────────────────
 		with ui.card().classes("w-full mt-3"):
-			ui.label("PHYSICS DEBUG").style(
-				"font-family:'VT323',monospace;font-size:1.4rem;color:#d4a017;letter-spacing:0.1em"
-			)
+			ui.label("PHYSICS DEBUG").classes("sim-section-title")
 			ui.label("Actor positions, FOV, and pathfinding results.").style(
 				"font-family:'VT323',monospace;font-size:1rem;color:#444"
 			)
