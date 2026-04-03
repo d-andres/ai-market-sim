@@ -14,10 +14,12 @@ from __future__ import annotations
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
+import re
 from typing import TYPE_CHECKING
 
 from src.models.schema import (
 	Actor,
+	ActorRole,
 	AttackParams,
 	ConverseParams,
 	ConversationPacket,
@@ -54,6 +56,24 @@ PLAN_FAILURE_COOLDOWN_TICKS: int = 15
 
 # Hard cap on simultaneous in-flight LLM planning requests.
 MAX_CONCURRENT_PLAN_JOBS: int = 10
+
+# Social/crime mechanics
+WITNESS_VISION_RANGE: int = 10
+SELF_DEFENSE_WINDOW_TICKS: int = 12
+
+# Dialogue-driven social inference
+POSITIVE_DIALOGUE_WORDS = (
+	"thanks", "thank", "please", "sorry", "friend", "help", "appreciate", "grateful"
+)
+NEGATIVE_DIALOGUE_WORDS = (
+	"idiot", "stupid", "hate", "liar", "scum", "trash", "fool"
+)
+THREAT_DIALOGUE_WORDS = (
+	"kill", "hurt", "attack", "destroy", "die"
+)
+ACCUSATION_DIALOGUE_WORDS = (
+	"stole", "steal", "thief", "murder", "murdered", "crime", "criminal", "attacked", "assault"
+)
 
 
 @dataclass
@@ -110,6 +130,9 @@ class SimulationEngine:
 		self._conversation_executor = ThreadPoolExecutor(max_workers=2)
 		# Keyed by listener (target) actor id → in-flight Future.
 		self._pending_packet_futures: dict[str, Future] = {}
+		# Combat and social tracking for crime/self-defense logic.
+		self._last_attack_tick: dict[tuple[str, str], int] = {}  # (attacker_id, victim_id) -> tick
+		self._suspicion: dict[tuple[str, str], int] = {}  # (accuser_id, suspect_id) -> score
 
 		# Initialize AI brains for each actor
 		self.agent_brains: dict[str, AgentBrain] = {}
@@ -162,6 +185,361 @@ class SimulationEngine:
 	def _actor_by_id(self, actor_id: str) -> Actor | None:
 		"""Find an actor by id from the current world state."""
 		return next((a for a in self.world_map.actors if a.id == actor_id), None)
+
+	def _adjust_likeness(self, observer: Actor, subject_id: str, delta: int) -> None:
+		"""Adjust observer's affinity/trust toward another actor, clamped to [-100, 100]."""
+		current = observer.likeness.get(subject_id, 0)
+		observer.likeness[subject_id] = max(-100, min(100, current + delta))
+
+	def suspicion_score(self, observer_id: str, suspect_id: str) -> int:
+		"""Get observer's current suspicion score about a suspect."""
+		return self._suspicion.get((observer_id, suspect_id), 0)
+
+	def _increase_suspicion(self, observer_id: str, suspect_id: str, delta: int) -> int:
+		"""Increase suspicion score and return the updated value."""
+		key = (observer_id, suspect_id)
+		self._suspicion[key] = self._suspicion.get(key, 0) + max(0, delta)
+		return self._suspicion[key]
+
+	def _adjust_suspicion(self, observer_id: str, suspect_id: str, delta: int) -> int:
+		"""Adjust suspicion score (positive or negative), clamped at 0 lower bound."""
+		key = (observer_id, suspect_id)
+		cur = self._suspicion.get(key, 0)
+		next_val = max(0, cur + delta)
+		self._suspicion[key] = next_val
+		return next_val
+
+	def _recent_events_for_dialogue(self, actor_ids: set[str], limit: int = 8) -> list[str]:
+		"""Recent event snippets involving relevant actors, for dialogue credibility context."""
+		out: list[str] = []
+		for e in reversed(self.events):
+			if e.actor_id in actor_ids or e.data.get("target_id") in actor_ids or e.data.get("offender_id") in actor_ids:
+				out.append(f"[tick {e.tick}] {e.event_type}: {e.description}")
+			if len(out) >= limit:
+				break
+		out.reverse()
+		return out
+
+	def _mentioned_actors(self, text: str, exclude_ids: set[str] | None = None) -> list[Actor]:
+		"""Find actor mentions by id or whole-word name tokens in free-form dialogue."""
+		exclude = exclude_ids or set()
+		lower = text.lower()
+		mentioned: list[Actor] = []
+
+		for candidate in self.world_map.actors:
+			if candidate.id in exclude:
+				continue
+			if candidate.id.lower() in lower:
+				mentioned.append(candidate)
+				continue
+			name_hit = False
+			for token in candidate.name.lower().split():
+				if len(token) < 4:
+					continue
+				if re.search(rf"\b{re.escape(token)}\b", lower):
+					name_hit = True
+					break
+			if name_hit:
+				mentioned.append(candidate)
+
+		return mentioned
+
+	def _apply_dialogue_social_effects(self, speaker: Actor, listener: Actor, line: str) -> None:
+		"""Adjust likeness/suspicion using simple lexical cues from free-form dialogue.
+
+		This intentionally lightweight parser gives LLM-generated conversation immediate
+		social consequences without needing a separate structured action.
+		"""
+		text = (line or "").lower().strip()
+		if not text:
+			return
+
+		candidate_actors = [a for a in self.world_map.actors if a.id != listener.id]
+		susp_snapshot = {a.id: self.suspicion_score(listener.id, a.id) for a in candidate_actors}
+		recent_events = self._recent_events_for_dialogue({speaker.id, listener.id, *[a.id for a in candidate_actors]})
+
+		impact: dict | None = None
+		listener_brain = self.agent_brains.get(listener.id)
+		if listener_brain is not None:
+			impact = listener_brain.assess_dialogue_social_impact(
+				speaker=speaker,
+				line=line,
+				candidate_actors=candidate_actors,
+				suspicion_snapshot=susp_snapshot,
+				recent_events=recent_events,
+			)
+
+		if impact is not None:
+			likeness_delta = int(impact.get("likeness_delta", 0))
+			if likeness_delta:
+				self._adjust_likeness(listener, speaker.id, likeness_delta)
+
+			action_bias = str(impact.get("action_bias", "watch"))
+			confidence = float(impact.get("confidence", 0.0))
+			rationale = str(impact.get("rationale", ""))
+			trust_to_speaker = listener.likeness.get(speaker.id, 0)
+
+			for suspect_id, raw_delta in (impact.get("suspicion_deltas", {}) or {}).items():
+				suspect = self._actor_by_id(suspect_id)
+				if suspect is None or suspect.id == listener.id:
+					continue
+
+				# Credibility gate: accusations from neutral/low-trust speakers shouldn't be
+				# strongly believed unless trust is earned.
+				delta = int(raw_delta)
+				if delta > 0:
+					if trust_to_speaker < 20:
+						delta = 0
+					else:
+						trust_factor = min(1.0, max(0.0, (trust_to_speaker - 20) / 60.0))
+						delta = max(1, int(round(delta * trust_factor)))
+					if confidence < 0.35:
+						delta = max(0, delta - 1)
+
+				updated = self._adjust_suspicion(listener.id, suspect.id, delta)
+				if delta != 0:
+					self._log_event(
+						listener.id,
+						"dialogue_suspicion",
+						f"{listener.name} updates suspicion of {suspect.name} after hearing {speaker.name}.",
+						{
+							"speaker_id": speaker.id,
+							"suspect_id": suspect.id,
+							"delta": delta,
+							"suspicion": updated,
+							"trust_to_speaker": trust_to_speaker,
+							"confidence": confidence,
+							"action_bias": action_bias,
+							"rationale": rationale,
+						},
+					)
+
+				if listener.role == ActorRole.GUARD and action_bias in {"question", "escalate"} and updated >= 8:
+					severity = min(12, max(3, updated // 2))
+					self._guard_confront_offender(listener, suspect, severity, "reported_crime")
+			return
+
+		# Heuristic fallback path (AI unavailable): still allows social updates in
+		# no-LLM tests or degraded runtime.
+		pos_hits = sum(1 for w in POSITIVE_DIALOGUE_WORDS if w in text)
+		neg_hits = sum(1 for w in NEGATIVE_DIALOGUE_WORDS if w in text)
+		threat_hits = sum(1 for w in THREAT_DIALOGUE_WORDS if w in text)
+		accusation_hits = sum(1 for w in ACCUSATION_DIALOGUE_WORDS if w in text)
+
+		if pos_hits:
+			self._adjust_likeness(listener, speaker.id, pos_hits)
+		if neg_hits:
+			self._adjust_likeness(listener, speaker.id, -2 * neg_hits)
+		if threat_hits:
+			self._adjust_likeness(listener, speaker.id, -3 * threat_hits)
+
+		if accusation_hits > 0:
+			trust_to_speaker = listener.likeness.get(speaker.id, 0)
+			mentioned = self._mentioned_actors(text, exclude_ids={speaker.id, listener.id})
+			for suspect in mentioned:
+				if trust_to_speaker < 20:
+					delta = 0
+				else:
+					delta = max(1, (1 + accusation_hits) // 2)
+				updated = self._adjust_suspicion(listener.id, suspect.id, delta)
+				if delta != 0:
+					self._log_event(
+						listener.id,
+						"dialogue_suspicion",
+						f"{listener.name} grows suspicious of {suspect.name} after hearing {speaker.name}.",
+						{
+							"speaker_id": speaker.id,
+							"suspect_id": suspect.id,
+							"delta": delta,
+							"suspicion": updated,
+							"trust_to_speaker": trust_to_speaker,
+						},
+					)
+					if listener.role == ActorRole.GUARD and updated >= 8:
+						severity = min(12, max(3, updated // 2))
+						self._guard_confront_offender(listener, suspect, severity, "reported_crime")
+
+	def _witnesses_at(
+		self,
+		x: int,
+		y: int,
+		exclude_ids: set[str] | None = None,
+	) -> list[Actor]:
+		"""Actors who can see a location (line-of-sight + range)."""
+		exclude = exclude_ids or set()
+		witnesses: list[Actor] = []
+		for observer in self.world_map.actors:
+			if observer.id in exclude:
+				continue
+			dist = physics.distance_chebyshev(observer.x, observer.y, x, y)
+			if dist > WITNESS_VISION_RANGE:
+				continue
+			if physics.can_see(self.world_map, observer.x, observer.y, x, y):
+				witnesses.append(observer)
+		return witnesses
+
+	def _theft_severity(self, item: Item) -> int:
+		"""Translate stolen item value to crime severity (1..25)."""
+		return max(1, min(25, (item.base_price // 20) + 1))
+
+	def _assault_severity(self, damage: int) -> int:
+		"""Translate attack damage into severity for witnessed assault."""
+		return max(2, min(20, damage // 2 + 2))
+
+	def _is_self_defense(self, attacker: Actor, target: Actor) -> bool:
+		"""Return True when target recently attacked attacker within defense window."""
+		last = self._last_attack_tick.get((target.id, attacker.id))
+		if last is None:
+			return False
+		return (self.tick_count - last) <= SELF_DEFENSE_WINDOW_TICKS
+
+	def _closest_guard(self, x: int, y: int) -> Actor | None:
+		guards = [a for a in self.world_map.actors if a.role == ActorRole.GUARD and a.hp > 0]
+		if not guards:
+			return None
+		return min(guards, key=lambda g: physics.distance_chebyshev(g.x, g.y, x, y))
+
+	def _guard_confront_offender(
+		self,
+		guard: Actor,
+		offender: Actor,
+		severity: int,
+		crime_type: str,
+		victim: Actor | None = None,
+	) -> None:
+		"""Immediate guard response based on offender infamy and crime severity."""
+		if guard.id == offender.id:
+			return
+		if offender not in self.world_map.actors or guard not in self.world_map.actors:
+			return
+
+		score = offender.infamy + (severity * 2)
+		if score < 20:
+			desc = (
+				f"{guard.name} confronts {offender.name} for {crime_type} but issues only a warning."
+			)
+			self._log_event(guard.id, "guard_warning", desc, {"offender_id": offender.id, "crime": crime_type})
+			self.interrupt_actor(offender.id, f"{guard.name} warned you: {crime_type} is criminal.")
+			self._adjust_likeness(guard, offender.id, -max(1, severity // 2))
+			return
+
+		if score < 45:
+			fine = min(offender.gold, max(5, severity * 3))
+			offender.gold -= fine
+			guard.gold += fine
+			desc = f"{guard.name} fines {offender.name} {fine}g for {crime_type}."
+			self._log_event(
+				guard.id,
+				"guard_fine",
+				desc,
+				{"offender_id": offender.id, "crime": crime_type, "fine": fine},
+			)
+			offender.infamy = max(0, offender.infamy - max(1, severity // 3))
+			self._adjust_likeness(guard, offender.id, -severity)
+			return
+
+		if score < 80:
+			damage = max(5, severity * 2)
+			if offender.hp > 1:
+				damage = min(damage, offender.hp - 1)
+			offender.hp = max(0, offender.hp - damage)
+			desc = f"{guard.name} beats {offender.name} for {damage} damage as punishment for {crime_type}."
+			self._log_event(
+				guard.id,
+				"guard_assault",
+				desc,
+				{"offender_id": offender.id, "crime": crime_type, "damage": damage, "hp": offender.hp},
+			)
+			offender.infamy = max(0, offender.infamy - max(1, severity // 2))
+			self._adjust_likeness(guard, offender.id, -severity * 2)
+			return
+
+		# Very high notoriety/severity => lethal force.
+		damage, is_crit = physics.calc_damage(guard, offender)
+		offender.hp = max(0, offender.hp - damage)
+		desc = (
+			f"{guard.name} attempts lethal force on {offender.name} for {crime_type} "
+			f"({damage} damage{' CRIT' if is_crit else ''})."
+		)
+		self._log_event(
+			guard.id,
+			"guard_lethal",
+			desc,
+			{"offender_id": offender.id, "crime": crime_type, "damage": damage, "hp": offender.hp},
+		)
+		self._adjust_likeness(guard, offender.id, -severity * 3)
+		if offender.hp == 0:
+			self._handle_actor_death(offender, killer=guard)
+
+	def _register_crime(
+		self,
+		offender: Actor,
+		crime_type: str,
+		severity: int,
+		x: int,
+		y: int,
+		victim: Actor | None = None,
+		details: dict | None = None,
+	) -> None:
+		"""Record a crime, update social state, and trigger witness/guard reactions."""
+		witnesses = self._witnesses_at(x, y, exclude_ids={offender.id})
+		witness_ids = [w.id for w in witnesses]
+
+		if witnesses:
+			offender.infamy += severity
+			offender.fame = max(0, offender.fame - max(0, severity // 3))
+
+		for w in witnesses:
+			self._adjust_likeness(w, offender.id, -severity)
+			brain = self.agent_brains.get(w.id)
+			if brain:
+				brain.memory.record(
+					tick=self.tick_count,
+					actor_id=offender.id,
+					event_type=f"witnessed_{crime_type}",
+					notes=(
+						f"I witnessed {offender.name} commit {crime_type} at ({x},{y}) "
+						f"(severity {severity})."
+					),
+				)
+			if w.role == ActorRole.GUARD:
+				self._guard_confront_offender(w, offender, severity, crime_type, victim=victim)
+
+		# Optional delayed-report flavor for shop thefts not directly witnessed.
+		if crime_type == "theft" and victim is not None and victim.id not in witness_ids:
+			self._suspicion[(victim.id, offender.id)] = self._suspicion.get((victim.id, offender.id), 0) + severity
+			guard = self._closest_guard(victim.x, victim.y)
+			if guard is not None:
+				self._log_event(
+					victim.id,
+					"report_theft",
+					f"{victim.name} suspects {offender.name} and reports theft to {guard.name}.",
+					{"suspect_id": offender.id, "severity": severity},
+				)
+				# Guard only punishes immediately if suspect still carries the stolen item.
+				stolen_item_id = (details or {}).get("item_id")
+				if stolen_item_id and any(i.id == stolen_item_id for i in offender.inventory):
+					self._guard_confront_offender(guard, offender, severity, "suspected_theft", victim=victim)
+				else:
+					self._adjust_likeness(victim, offender.id, -max(1, severity // 2))
+
+		payload = {
+			"crime_type": crime_type,
+			"severity": severity,
+			"offender_id": offender.id,
+			"victim_id": victim.id if victim else None,
+			"witnesses": witness_ids,
+		}
+		if details:
+			payload.update(details)
+
+		self._log_event(
+			offender.id,
+			"crime",
+			f"{offender.name} committed {crime_type} (severity {severity}). "
+			+ (f"Witnessed by {len(witnesses)} actor(s)." if witnesses else "No direct witnesses."),
+			payload,
+		)
 
 	def _submit_plan_request(self, actor: Actor, brain: AgentBrain) -> None:
 		"""Submit a non-blocking LLM planning request for one actor."""
@@ -496,12 +874,10 @@ class SimulationEngine:
 			self.interrupt_actor(actor.id, reason)
 			return reason
 
-		if target_gi.owner_id is not None and target_gi.owner_id != actor.id:
+		owner = None
+		is_theft = target_gi.owner_id is not None and target_gi.owner_id != actor.id
+		if is_theft:
 			owner = self._actor_by_id(target_gi.owner_id)
-			owner_name = owner.name if owner else target_gi.owner_id
-			reason = f"'{target_gi.item.name}' belongs to {owner_name} — propose a trade to acquire it"
-			self.interrupt_actor(actor.id, reason)
-			return reason
 
 		# Carry-capacity check
 		if self._carry_count(actor) >= actor.max_carry:
@@ -517,8 +893,32 @@ class SimulationEngine:
 			gi for gi in self.world_map.world_items if gi is not target_gi
 		]
 		actor.inventory.append(target_gi.item)
-		desc = f"{actor.name} picked up {target_gi.item.name} x{target_gi.item.quantity}"
-		self._log_event(actor.id, "pick_up", desc, {"item_id": target_gi.item.id, "x": target_gi.x, "y": target_gi.y})
+
+		if is_theft:
+			severity = self._theft_severity(target_gi.item)
+			self._register_crime(
+				offender=actor,
+				crime_type="theft",
+				severity=severity,
+				x=target_gi.x,
+				y=target_gi.y,
+				victim=owner,
+				details={"item_id": target_gi.item.id, "item_value": target_gi.item.base_price},
+			)
+			owner_name = owner.name if owner else str(target_gi.owner_id)
+			desc = (
+				f"WARNING: {actor.name} steals {target_gi.item.name} from {owner_name}! "
+				f"(value {target_gi.item.base_price}g)"
+			)
+			self._log_event(
+				actor.id,
+				"steal",
+				desc,
+				{"item_id": target_gi.item.id, "owner_id": target_gi.owner_id, "x": target_gi.x, "y": target_gi.y},
+			)
+		else:
+			desc = f"{actor.name} picked up {target_gi.item.name} x{target_gi.item.quantity}"
+			self._log_event(actor.id, "pick_up", desc, {"item_id": target_gi.item.id, "x": target_gi.x, "y": target_gi.y})
 		return desc
 
 	def _execute_place_action(self, actor: Actor, action: PlannedAction) -> str:
@@ -653,6 +1053,10 @@ class SimulationEngine:
 			{"target_id": actor.id, "line": reply},
 		)
 
+		# Free-form dialogue can shape trust/suspicion.
+		self._apply_dialogue_social_effects(speaker=actor, listener=target, line=opening_line)
+		self._apply_dialogue_social_effects(speaker=target, listener=actor, line=reply)
+
 		# Both actors record the exchange in their relationship memory
 		initiator_brain = self.agent_brains.get(actor.id)
 		if initiator_brain:
@@ -698,6 +1102,20 @@ class SimulationEngine:
 
 		damage, is_crit = physics.calc_damage(actor, target)
 		target.hp = max(0, target.hp - damage)
+		self._last_attack_tick[(actor.id, target.id)] = self.tick_count
+
+		# Unprovoked witnessed assault is a crime; retaliation in recent self-defense window is exempt.
+		if not self._is_self_defense(actor, target):
+			severity = self._assault_severity(damage)
+			self._register_crime(
+				offender=actor,
+				crime_type="assault",
+				severity=severity,
+				x=actor.x,
+				y=actor.y,
+				victim=target,
+				details={"target_id": target.id, "damage": damage},
+			)
 
 		crit_str = " (CRITICAL HIT!)" if is_crit else ""
 		desc = (
@@ -988,6 +1406,8 @@ class SimulationEngine:
 					"x": actor.x,
 					"y": actor.y,
 					"gold": actor.gold,
+					"fame": actor.fame,
+					"infamy": actor.infamy,
 					"hp": actor.hp,
 				}
 				for actor in self.world_map.actors

@@ -178,6 +178,9 @@ class Actor(BaseModel):
 	x: int = Field(ge=0)
 	y: int = Field(ge=0)
 	gold: int = Field(default=0, ge=0)
+	# Public social standing. Fame is positive notoriety; infamy is criminal notoriety.
+	fame: int = Field(default=0, ge=0)
+	infamy: int = Field(default=0, ge=0)
 	hp: int = Field(default=100, ge=0)
 	max_hp: int = Field(default=100, ge=1)
 	# ── Combat base stats (before equipment bonuses) ───────────────────────
@@ -201,6 +204,8 @@ class Actor(BaseModel):
 			"offhand": None,
 		}
 	)
+	# Per-actor affinity/trust memory: actor_id -> score (-100..100, higher = likes/trusts more)
+	likeness: dict[str, int] = Field(default_factory=dict)
 	# ── Reactive planning state ────────────────────────────────────────────
 	action_queue: list[PlannedAction] = Field(default_factory=list)
 	needs_replan: bool = Field(default=True)

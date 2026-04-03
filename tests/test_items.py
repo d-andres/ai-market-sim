@@ -206,7 +206,7 @@ def test_place_item_visible_on_ground():
     memory = RelationshipMemory()
     obs_tool = ObserveSurroundingsTool(actor=guard, world_map=world_map, memory=memory)
     output = obs_tool.forward(vision_range=10)
-    assert "Items on the ground" in output, f"Guard should see floor items:\n{output}"
+    assert "Items in view" in output, f"Guard should see floor items:\n{output}"
     assert "Short Sword" in output, f"Guard should see the sword:\n{output}"
     print("PASS  test_place_item_visible_on_ground")
     return output
@@ -247,8 +247,8 @@ def test_pickup_floor_item():
 # Test 4c: pick_up blocked for owned shelf item
 # ---------------------------------------------------------------------------
 
-def test_cannot_pickup_owned_shelf_item():
-    """A player cannot pick up a shelf item owned by the shopkeeper."""
+def test_pickup_owned_shelf_item_counts_as_theft():
+    """A player can pick up an owned shelf item, but it is treated as theft."""
     world_map = _make_map()
     sk = _shopkeeper(x=3, y=3)
     player = _player(x=2, y=2)  # adjacent to shelf tile (1,1) and (2,1)
@@ -264,15 +264,16 @@ def test_cannot_pickup_owned_shelf_item():
     )
     result = engine._execute_action(player, pickup_action)
 
-    # Should be blocked — item still on shelf
+    # Theft succeeds — item removed from shelf and moved to player inventory
     remaining = [gi.item.id for gi in world_map.world_items]
-    assert "potion_health" in remaining, f"Owned item should still be on shelf: {remaining}"
+    assert "potion_health" not in remaining, f"Owned item should be removed from shelf: {remaining}"
     player_items = [i.id for i in player.inventory]
-    assert "potion_health" not in player_items, f"Player should not have stolen item: {player_items}"
-    assert "trade" in result.lower() or "belong" in result.lower(), (
-        f"Expected a 'belongs to owner / propose trade' message, got: {result}"
+    assert "potion_health" in player_items, f"Player should have stolen item: {player_items}"
+    assert "warning" in result.lower() or "steal" in result.lower(), (
+        f"Expected a theft warning message, got: {result}"
     )
-    print("PASS  test_cannot_pickup_owned_shelf_item")
+    assert player.infamy > 0, f"Theft should increase infamy, got: {player.infamy}"
+    print("PASS  test_pickup_owned_shelf_item_counts_as_theft")
 
 
 # ---------------------------------------------------------------------------
@@ -319,7 +320,7 @@ if __name__ == "__main__":
         test_inventory_not_in_world_items,
         test_place_item_visible_on_ground,
         test_pickup_floor_item,
-        test_cannot_pickup_owned_shelf_item,
+        test_pickup_owned_shelf_item_counts_as_theft,
         test_ascii_render_symbols,
     ]
 

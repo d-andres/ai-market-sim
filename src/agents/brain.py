@@ -13,13 +13,20 @@ See AI-AGENT-INTEGRATION.md for setup instructions.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+import re
 from typing import TYPE_CHECKING
 
 from smolagents import Tool, LiteLLMModel, ChatMessage, MessageRole
 
 from src.models.schema import Actor, Map, PlannedAction, TradeProposal
 from src.simulation import physics
-from src.agents.prompts import TRADE_EVALUATION_PROMPT, CONVERSATION_RANGE, get_system_prompt_for_role
+from src.agents.prompts import (
+	TRADE_EVALUATION_PROMPT,
+	CONVERSATION_RANGE,
+	DIALOGUE_SOCIAL_IMPACT_PROMPT,
+	get_system_prompt_for_role,
+)
 from src.agents.response_parser import parse_plan, parse_trade_decision
 
 if TYPE_CHECKING:
@@ -91,11 +98,19 @@ class ObserveSurroundingsTool(Tool):
 	}
 	output_type = "string"
 	
-	def __init__(self, actor: Actor, world_map: Map, memory: RelationshipMemory, **kwargs):
+	def __init__(
+		self,
+		actor: Actor,
+		world_map: Map,
+		memory: RelationshipMemory,
+		engine: SimulationEngine | None = None,
+		**kwargs,
+	):
 		super().__init__(**kwargs)
 		self.actor = actor
 		self.world_map = world_map
 		self.memory = memory
+		self.engine = engine
 	
 	def forward(self, vision_range: int = 10) -> str:
 		viewport = physics.get_visible_tiles_and_actors(
@@ -105,6 +120,7 @@ class ObserveSurroundingsTool(Tool):
 		lines: list[str] = []
 		lines.append(f"You are at ({self.actor.x}, {self.actor.y}).")
 		lines.append(f"Your gold: {self.actor.gold}g")
+		lines.append(f"Your social standing: fame {self.actor.fame}, infamy {self.actor.infamy}")
 		lines.append(
 			f"Your combat stats: HP {self.actor.hp}/{self.actor.max_hp}, "
 			f"ATK {self.actor.base_attack}, DEF {self.actor.base_defense}, "
@@ -128,6 +144,7 @@ class ObserveSurroundingsTool(Tool):
 		if viewport.visible_actors:
 			lines.append("\nVisible actors:")
 			for other in viewport.visible_actors:
+				suspicion = self.engine.suspicion_score(self.actor.id, other.id) if self.engine else 0
 				dist = physics.distance_chebyshev(
 					self.actor.x, self.actor.y, other.x, other.y
 				)
@@ -151,7 +168,9 @@ class ObserveSurroundingsTool(Tool):
 					+ (" [TRADE RANGE — use propose_trade]" if dist <= 2 else "")
 					+ (" [CONVERSATION RANGE — can use converse]" if dist <= CONVERSATION_RANGE else "")
 					+ (" [ATTACK RANGE — can use attack]" if dist <= 1 else "")
-					+ f", gold {other.gold}g, HP {other.hp}/{other.max_hp}"
+					+ f", gold {other.gold}g, HP {other.hp}/{other.max_hp}, fame {other.fame}, infamy {other.infamy}"
+					+ f", your_likeness {self.actor.likeness.get(other.id, 0)}"
+					+ f", your_suspicion {suspicion}"
 					+ f" | carrying/selling: {inv_str}"
 				)
 				history = self.memory.summary_for(other.id, other.name)
@@ -159,27 +178,35 @@ class ObserveSurroundingsTool(Tool):
 		else:
 			lines.append("\nNo other actors visible.")
 
-		# Unowned items on the ground (can be picked up)
+		# Ground/shelf items in view (owned shelf items can be stolen)
 		visible_set = set(viewport.visible_tiles)
-		unowned_gis = [
+		visible_gis = [
 			gi for gi in self.world_map.world_items
-			if (gi.x, gi.y) in visible_set and gi.owner_id is None
+			if (gi.x, gi.y) in visible_set
 		]
 		carry_full = len(self.actor.inventory) >= self.actor.max_carry
-		if unowned_gis:
-			header = "\nItems on the ground (unowned — can use pick_up):"
+		if visible_gis:
+			header = "\nItems in view (pick_up allowed in range; owned items count as theft):"
 			if carry_full:
 				header += " [INVENTORY FULL — drop/place something first]"
 			lines.append(header)
 			by_pos: dict[tuple[int, int], list] = {}
-			for gi in unowned_gis:
+			for gi in visible_gis:
 				by_pos.setdefault((gi.x, gi.y), []).append(gi)
 			for (gx, gy), gis in sorted(by_pos.items()):
 				dist = physics.distance_chebyshev(self.actor.x, self.actor.y, gx, gy)
 				item_strs = []
 				for gi in gis:
 					is_corpse = gi.item.metadata.get("category") == "corpse"
-					label = f"{gi.item.name} (id:{gi.item.id})" + (" [CORPSE]" if is_corpse else f" x{gi.item.quantity}")
+					if is_corpse:
+						label = f"{gi.item.name} (id:{gi.item.id}) [CORPSE]"
+					elif gi.owner_id is None or gi.owner_id == self.actor.id:
+						label = f"{gi.item.name} (id:{gi.item.id}) x{gi.item.quantity} [FREE PICKUP]"
+					else:
+						label = (
+							f"{gi.item.name} (id:{gi.item.id}) x{gi.item.quantity} "
+							f"[OWNED by {gi.owner_id} — PICKUP IS THEFT, severity by value {gi.item.base_price}g]"
+						)
 					item_strs.append(label)
 				pickup_hint = " [PICK UP RANGE]" if dist <= 1 and not carry_full else ""
 				lines.append(f"  - ({gx},{gy}) dist {dist}{pickup_hint}: {', '.join(item_strs)}")
@@ -231,7 +258,7 @@ class AgentBrain:
 		self.model = LiteLLMModel(model_id=model_name, api_base=api_base)
 		self.system_prompt = get_system_prompt_for_role(actor.role)
 		self.obs_tool = ObserveSurroundingsTool(
-			actor=actor, world_map=world_map, memory=self.memory
+			actor=actor, world_map=world_map, memory=self.memory, engine=engine
 		)
 
 	def create_plan(self, interrupt_reason: str = "") -> tuple[list[PlannedAction], str]:
@@ -257,7 +284,7 @@ class AgentBrain:
 			f"Tick {self.engine.tick_count} | HP: {self.actor.hp}/{self.actor.max_hp} | "
 			f"ATK: {self.actor.base_attack} | DEF: {self.actor.base_defense} | "
 			f"CRIT: {self.actor.base_crit:.0%} | "
-			f"Gold: {self.actor.gold}g | Carrying: {inv_summary}\n\n"
+			f"Gold: {self.actor.gold}g | Fame: {self.actor.fame} | Infamy: {self.actor.infamy} | Carrying: {inv_summary}\n\n"
 			f"WORLD OBSERVATION:\n{observation}"
 			f"{interrupt_ctx}\n\n"
 			f"Create a plan of {self.PLAN_HORIZON} steps (fill all {self.PLAN_HORIZON} — do not stop early). "
@@ -267,6 +294,7 @@ class AgentBrain:
 			"TRADE REMINDER: if an actor is marked [TRADE RANGE], do NOT move — use propose_trade immediately.\n"
 			"CONVERSE REMINDER: if an actor is marked [CONVERSATION RANGE], you may use converse to talk with them — useful for building relationships, gathering information, or roleplay.\n"
 			"ATTACK REMINDER: if an actor is marked [ATTACK RANGE], you may attack them with attack. Only attack if it makes sense for your character.\n"
+			"CRIME REMINDER: stealing owned shelf items or initiating unprovoked violence can increase infamy and trigger guard punishment if witnessed.\n"
 			"EQUIP REMINDER: use equip to put an item from your inventory into its slot. The item's slot is defined in items.json (hand, chest, head, legs, offhand). Two-handed weapons go in hand and block offhand.\n"
 			"Return ONLY a valid JSON object with exactly two keys:\n"
 			'  "summary": a single sentence (15-25 words) written in third person describing '
@@ -388,6 +416,71 @@ class AgentBrain:
 			return f"{self.actor.name} says nothing.", [], "", "No impression formed."
 		return _parse_conversation_packet_response(raw, self.actor.name)
 
+	def assess_dialogue_social_impact(
+		self,
+		speaker: Actor,
+		line: str,
+		candidate_actors: list[Actor],
+		suspicion_snapshot: dict[str, int],
+		recent_events: list[str],
+	) -> dict:
+		"""Ask the listener LLM how free-form dialogue should alter trust/suspicion.
+
+		This is intentionally advisory: the engine clamps and applies outputs conservatively.
+		"""
+		relationship = self.memory.summary_for(speaker.id, speaker.name)
+		candidates = [
+			{
+				"id": a.id,
+				"name": a.name,
+				"role": a.role.value,
+				"fame": a.fame,
+				"infamy": a.infamy,
+				"likeness": self.actor.likeness.get(a.id, 0),
+				"suspicion": suspicion_snapshot.get(a.id, 0),
+			}
+			for a in candidate_actors
+			if a.id != self.actor.id
+		]
+
+		prompt = DIALOGUE_SOCIAL_IMPACT_PROMPT.format(
+			listener_name=self.actor.name,
+			listener_role=self.actor.role.value,
+			listener_fame=self.actor.fame,
+			listener_infamy=self.actor.infamy,
+			listener_hp=self.actor.hp,
+			listener_max_hp=self.actor.max_hp,
+			speaker_name=speaker.name,
+			speaker_role=speaker.role.value,
+			speaker_fame=speaker.fame,
+			speaker_infamy=speaker.infamy,
+			speaker_hp=speaker.hp,
+			speaker_max_hp=speaker.max_hp,
+			likeness_to_speaker=self.actor.likeness.get(speaker.id, 0),
+			relationship_history=relationship,
+			recent_events="\n".join(recent_events) if recent_events else "(none)",
+			suspicion_snapshot=json.dumps(suspicion_snapshot, ensure_ascii=True),
+			candidate_actors=json.dumps(candidates, ensure_ascii=True),
+			line=line,
+		)
+
+		try:
+			response = self.model([
+				ChatMessage(role=MessageRole.SYSTEM, content=[{"type": "text", "text": self.system_prompt}]),
+				ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": prompt}]),
+			])
+			raw = response.content if hasattr(response, "content") else str(response)
+		except Exception:
+			return {
+				"likeness_delta": 0,
+				"suspicion_deltas": {},
+				"action_bias": "watch",
+				"confidence": 0.0,
+				"rationale": "llm_unavailable",
+			}
+
+		return _parse_dialogue_social_impact_response(raw, candidates)
+
 def _parse_conversation_packet_response(raw: str, actor_name: str) -> tuple[str, list[str], str, str]:
 	"""Extract REPLY / FOLLOW_UP_n / IMPRESSION / TONE lines from a packet prompt response."""
 	from src.agents.response_parser import clean
@@ -414,6 +507,61 @@ def _parse_conversation_packet_response(raw: str, actor_name: str) -> tuple[str,
 		elif upper.startswith("TONE:"):
 			tone = line.split(":", 1)[1].strip()
 	return reply, follow_ups, tone, impression
+
+
+def _parse_dialogue_social_impact_response(raw: str, candidates: list[dict]) -> dict:
+	"""Parse strict JSON from dialogue impact response and clamp values."""
+	text = raw.strip()
+	match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+	if match:
+		text = match.group(0)
+
+	try:
+		obj = json.loads(text)
+	except Exception:
+		return {
+			"likeness_delta": 0,
+			"suspicion_deltas": {},
+			"action_bias": "watch",
+			"confidence": 0.0,
+			"rationale": "parse_failed",
+		}
+
+	allowed_ids = {c["id"] for c in candidates}
+	likeness_delta = int(obj.get("likeness_delta", 0))
+	likeness_delta = max(-6, min(6, likeness_delta))
+
+	susp_raw = obj.get("suspicion_deltas", {}) or {}
+	susp_out: dict[str, int] = {}
+	if isinstance(susp_raw, dict):
+		for k, v in susp_raw.items():
+			if k not in allowed_ids:
+				continue
+			try:
+				dv = int(v)
+			except Exception:
+				continue
+			susp_out[k] = max(-4, min(6, dv))
+
+	action_bias = str(obj.get("action_bias", "watch")).strip().lower()
+	if action_bias not in {"ignore", "watch", "question", "escalate"}:
+		action_bias = "watch"
+
+	try:
+		confidence = float(obj.get("confidence", 0.0))
+	except Exception:
+		confidence = 0.0
+	confidence = max(0.0, min(1.0, confidence))
+
+	rationale = str(obj.get("rationale", ""))
+
+	return {
+		"likeness_delta": likeness_delta,
+		"suspicion_deltas": susp_out,
+		"action_bias": action_bias,
+		"confidence": confidence,
+		"rationale": rationale,
+	}
 
 
 def create_agent_for_actor(

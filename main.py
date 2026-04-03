@@ -15,7 +15,7 @@ from nicegui import ui
 
 from data import load_or_build_default_map, render_ascii, load_item_catalog
 from src.ui import register_pages
-from src.models.schema import Actor, ActorRole, Item, WorldItem
+from src.models.schema import Actor, ActorRole, WorldItem
 from src.simulation.physics import get_visible_tiles_and_actors, breadth_first_search
 from src.simulation.engine import initialize_engine
 
@@ -78,17 +78,31 @@ def _populate_default_items(world_map) -> None:
 
     catalog = load_item_catalog()
 
+    # Cycle through shop tiles so we can place most/all catalog items even when
+    # the map has fewer shelf tiles than item types.
     for i, item in enumerate(catalog):
-        if i >= len(shop_tiles):
-            break
-        tx, ty = shop_tiles[i]
+        tx, ty = shop_tiles[i % len(shop_tiles)]
         world_map.world_items.append(
-            WorldItem(item=item, x=tx, y=ty, owner_id=owner_id)
+            WorldItem(item=item.model_copy(deep=True), x=tx, y=ty, owner_id=owner_id)
         )
 
 
 def _default_actors() -> list[Actor]:
     """Create default actor population used when a map has no actors."""
+    catalog = {item.id: item for item in load_item_catalog()}
+
+    def _catalog_item(item_id: str):
+        item = catalog.get(item_id)
+        return item.model_copy(deep=True) if item else None
+
+    guard_equipped = {
+        "head": _catalog_item("iron_helmet"),
+        "chest": _catalog_item("iron_chest"),
+        "legs": _catalog_item("iron_plates"),
+        "hand": _catalog_item("short_sword"),
+        "offhand": _catalog_item("shield"),
+    }
+
     return [
         Actor(
             id="guard_1",
@@ -103,6 +117,7 @@ def _default_actors() -> list[Actor]:
             base_defense=3,
             base_crit=0.05,
             max_carry=8,
+            equipped=guard_equipped,
         ),
         Actor(
             id="shopkeeper_1",
@@ -124,7 +139,7 @@ def _default_actors() -> list[Actor]:
             role=ActorRole.PLAYER,
             x=10,
             y=10,
-            gold=0,
+            gold=50,
             hp=100,
             max_hp=100,
             base_attack=6,

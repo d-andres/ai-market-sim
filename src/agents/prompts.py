@@ -207,6 +207,54 @@ TONE: <one word describing your emotional tone, e.g. guarded/warm/amused/hostile
 """
 
 
+DIALOGUE_SOCIAL_IMPACT_PROMPT = """You are deciding how {listener_name} ({listener_role}) privately updates trust/suspicion
+after hearing a free-form line from {speaker_name} ({speaker_role}).
+
+Listener status:
+- fame: {listener_fame}
+- infamy: {listener_infamy}
+- hp: {listener_hp}/{listener_max_hp}
+
+Speaker status:
+- fame: {speaker_fame}
+- infamy: {speaker_infamy}
+- hp: {speaker_hp}/{speaker_max_hp}
+
+Current relationship (listener -> speaker):
+- likeness: {likeness_to_speaker}  (range -100..100)
+- historical memory:
+{relationship_history}
+
+Recent world events potentially relevant:
+{recent_events}
+
+Current suspicion snapshot (listener about others):
+{suspicion_snapshot}
+
+Known actor candidates mentioned in dialogue:
+{candidate_actors}
+
+Dialogue line to evaluate:
+"{line}"
+
+Rules:
+1) Consider personality/role first, then trust/likeness, then evidence and recent actions.
+2) Do NOT assume accusations are true by default.
+3) If speaker is neutral/low-trust and gives weak evidence, keep suspicion low.
+4) If line seems manipulative, threatening, or abusive, reduce likeness.
+5) You may increase or decrease suspicion for named candidates.
+
+Return ONLY valid JSON with this exact schema:
+{
+	"likeness_delta": integer in [-6, 6],
+	"suspicion_deltas": {"<actor_id>": integer in [-4, 6]},
+	"action_bias": "ignore" | "watch" | "question" | "escalate",
+	"confidence": float in [0, 1],
+	"rationale": "short private reason"
+}
+"""
+
+
 def get_system_prompt_for_role(role: ActorRole) -> str:
 	"""Get the system prompt for a given actor role.
 	
