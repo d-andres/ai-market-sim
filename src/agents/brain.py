@@ -105,12 +105,25 @@ class ObserveSurroundingsTool(Tool):
 		lines: list[str] = []
 		lines.append(f"You are at ({self.actor.x}, {self.actor.y}).")
 		lines.append(f"Your gold: {self.actor.gold}g")
+		lines.append(
+			f"Your combat stats: HP {self.actor.hp}/{self.actor.max_hp}, "
+			f"ATK {self.actor.base_attack}, DEF {self.actor.base_defense}, "
+			f"CRIT {self.actor.base_crit:.0%}"
+		)
 
 		if self.actor.inventory:
 			inv = ", ".join(f"{i.name} x{i.quantity}" for i in self.actor.inventory)
-			lines.append(f"Your inventory: {inv}")
+			lines.append(f"Your inventory ({len(self.actor.inventory)}/{self.actor.max_carry}): {inv}")
 		else:
-			lines.append("Your inventory: (empty)")
+			lines.append(f"Your inventory (0/{self.actor.max_carry}): (empty)")
+
+		equipped_strs = [
+			f"{slot}: {item.name}" for slot, item in self.actor.equipped.items() if item is not None
+		]
+		if equipped_strs:
+			lines.append(f"Your equipped: {', '.join(equipped_strs)}")
+		else:
+			lines.append("Your equipped: (nothing)")
 
 		if viewport.visible_actors:
 			lines.append("\nVisible actors:")
@@ -137,7 +150,9 @@ class ObserveSurroundingsTool(Tool):
 					f"dist {dist}, direction: {direction_hint}"
 					+ (" [TRADE RANGE — use propose_trade]" if dist <= 2 else "")
 					+ (" [CONVERSATION RANGE — can use converse]" if dist <= CONVERSATION_RANGE else "")
-					+ f", gold {other.gold}g | carrying/selling: {inv_str}"
+					+ (" [ATTACK RANGE — can use attack]" if dist <= 1 else "")
+					+ f", gold {other.gold}g, HP {other.hp}/{other.max_hp}"
+					+ f" | carrying/selling: {inv_str}"
 				)
 				history = self.memory.summary_for(other.id, other.name)
 				lines.append(f"    History: {history}")
@@ -150,18 +165,23 @@ class ObserveSurroundingsTool(Tool):
 			gi for gi in self.world_map.world_items
 			if (gi.x, gi.y) in visible_set and gi.owner_id is None
 		]
+		carry_full = len(self.actor.inventory) >= self.actor.max_carry
 		if unowned_gis:
-			lines.append("\nItems on the ground (unowned — can use pick_up):")
+			header = "\nItems on the ground (unowned — can use pick_up):"
+			if carry_full:
+				header += " [INVENTORY FULL — drop/place something first]"
+			lines.append(header)
 			by_pos: dict[tuple[int, int], list] = {}
 			for gi in unowned_gis:
 				by_pos.setdefault((gi.x, gi.y), []).append(gi)
 			for (gx, gy), gis in sorted(by_pos.items()):
 				dist = physics.distance_chebyshev(self.actor.x, self.actor.y, gx, gy)
-				item_strs = [
-					f"{gi.item.name} (id:{gi.item.id}) x{gi.item.quantity}"
-					for gi in gis
-				]
-				pickup_hint = " [PICK UP RANGE]" if dist <= 1 else ""
+				item_strs = []
+				for gi in gis:
+					is_corpse = gi.item.metadata.get("category") == "corpse"
+					label = f"{gi.item.name} (id:{gi.item.id})" + (" [CORPSE]" if is_corpse else f" x{gi.item.quantity}")
+					item_strs.append(label)
+				pickup_hint = " [PICK UP RANGE]" if dist <= 1 and not carry_full else ""
 				lines.append(f"  - ({gx},{gy}) dist {dist}{pickup_hint}: {', '.join(item_strs)}")
 
 		shop_coords = [
@@ -234,7 +254,9 @@ class AgentBrain:
 			)
 
 		user_msg = (
-			f"Tick {self.engine.tick_count} | HP: {self.actor.hp} | "
+			f"Tick {self.engine.tick_count} | HP: {self.actor.hp}/{self.actor.max_hp} | "
+			f"ATK: {self.actor.base_attack} | DEF: {self.actor.base_defense} | "
+			f"CRIT: {self.actor.base_crit:.0%} | "
 			f"Gold: {self.actor.gold}g | Carrying: {inv_summary}\n\n"
 			f"WORLD OBSERVATION:\n{observation}"
 			f"{interrupt_ctx}\n\n"
@@ -244,6 +266,8 @@ class AgentBrain:
 			"MOVEMENT REMINDER: y increases southward. To move toward a higher y, go south. To move toward a lower y, go north. To move toward a higher x, go east. To move toward a lower x, go west.\n"
 			"TRADE REMINDER: if an actor is marked [TRADE RANGE], do NOT move — use propose_trade immediately.\n"
 			"CONVERSE REMINDER: if an actor is marked [CONVERSATION RANGE], you may use converse to talk with them — useful for building relationships, gathering information, or roleplay.\n"
+			"ATTACK REMINDER: if an actor is marked [ATTACK RANGE], you may attack them with attack. Only attack if it makes sense for your character.\n"
+			"EQUIP REMINDER: use equip to put an item from your inventory into its slot. The item's slot is defined in items.json (hand, chest, head, legs, offhand). Two-handed weapons go in hand and block offhand.\n"
 			"Return ONLY a valid JSON object with exactly two keys:\n"
 			'  "summary": a single sentence (15-25 words) written in third person describing '
 			"your character's thoughts and intended actions in their own voice and personality.\n"
@@ -256,6 +280,10 @@ class AgentBrain:
 			'    {"action_type": "converse", "params": {"target_actor_id": "<use the id field from observation>", "opening_line": "What do you sell here?"}, "reason": ""}\n'
 			'    {"action_type": "pick_up", "params": {"item_id": "<id from items on ground list>"}, "reason": ""}\n'
 			'    {"action_type": "place", "params": {"item_id": "<id from your inventory>", "x": 5, "y": 3}, "reason": ""}\n'
+			'    {"action_type": "attack", "params": {"target_actor_id": "<id from observation>"}, "reason": ""}\n'
+			'    {"action_type": "equip", "params": {"item_id": "<id from your inventory>"}, "reason": ""}\n'
+			'    {"action_type": "unequip", "params": {"slot": "hand"}, "reason": ""}\n'
+			'    {"action_type": "use_item", "params": {"item_id": "<id of consumable in your inventory>"}, "reason": ""}\n'
 			"Valid directions: north, south, east, west, northeast, northwest, southeast, southwest.\n"
 			"TRADE NOTE: to buy a shopkeeper's shelf item, use propose_trade with the item id shown in their carrying/selling list.\n"
 			"PICK UP NOTE: use pick_up only for unowned floor items marked [PICK UP RANGE].\n"

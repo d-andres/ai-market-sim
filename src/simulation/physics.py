@@ -356,8 +356,55 @@ def breadth_first_search(
 	return None
 
 
+# ── Combat Mechanics ──────────────────────────────────────────────────────────
+
+# Maximum Chebyshev distance for a melee attack to connect.
+MELEE_RANGE: int = 1
+
+
+def calc_damage(attacker: Actor, defender: Actor) -> tuple[int, bool]:
+	"""Calculate melee damage and whether the hit is a critical strike.
+
+	Formula:
+	  total_attack  = attacker.base_attack + weapon.attack_bonus  (weapon = hand slot)
+	  total_defense = defender.base_defense + sum(equipped item defense_bonus)
+	  crit_chance   = attacker.base_crit + weapon.crit_bonus
+	  multiplier    = 2.0 on crit, else 1.0
+	  damage        = max(1, floor(total_attack * multiplier) - total_defense)
+
+	Two-handed weapons (slot="two_hand") are stored in the 'hand' equipped slot.
+
+	Args:
+	    attacker: The attacking Actor.
+	    defender: The defending Actor.
+
+	Returns:
+	    (damage: int, is_crit: bool)
+	"""
+	import random
+
+	# Attacker offense
+	weapon = attacker.equipped.get("hand")
+	weapon_attack = weapon.attack_bonus if weapon else 0
+	weapon_crit = weapon.crit_bonus if weapon else 0.0
+	total_attack = attacker.base_attack + weapon_attack
+	crit_chance = min(1.0, attacker.base_crit + weapon_crit)
+
+	# Defender defense (all equipped slots)
+	total_defense = defender.base_defense + sum(
+		item.defense_bonus for item in defender.equipped.values() if item is not None
+	)
+
+	is_crit = random.random() < crit_chance
+	multiplier = 2.0 if is_crit else 1.0
+	damage = max(1, int(total_attack * multiplier) - total_defense)
+
+	return damage, is_crit
+
+
 __all__ = [
 	"DIRECTIONS_8",
+	"MELEE_RANGE",
 	"is_walkable",
 	"get_blocking_actor",
 	"can_move_to",
@@ -369,5 +416,6 @@ __all__ = [
 	"get_visible_actors",
 	"get_visible_tiles_and_actors",
 	"breadth_first_search",
+	"calc_damage",
 	"Viewport",
 ]

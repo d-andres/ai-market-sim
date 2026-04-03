@@ -13,7 +13,7 @@ from threading import Lock
 from fastapi import FastAPI
 from nicegui import ui
 
-from data import load_or_build_default_map, render_ascii
+from data import load_or_build_default_map, render_ascii, load_item_catalog
 from src.ui import register_pages
 from src.models.schema import Actor, ActorRole, Item, WorldItem
 from src.simulation.physics import get_visible_tiles_and_actors, breadth_first_search
@@ -66,7 +66,7 @@ _runtime_state = {
 
 
 def _populate_default_items(world_map) -> None:
-    """Place default items on shop shelves owned by the shopkeeper."""
+    """Place default items from items.json on shop shelves owned by the shopkeeper."""
     shopkeeper = next(
         (a for a in world_map.actors if a.role == ActorRole.SHOPKEEPER), None
     )
@@ -76,20 +76,7 @@ def _populate_default_items(world_map) -> None:
     if not shop_tiles:
         return
 
-    catalog = [
-        Item(id="potion_health",  name="Health Potion",  description="Restores 20 HP.",                    base_price=10, quantity=3),
-        Item(id="potion_mana",    name="Mana Potion",    description="Restores magical energy.",            base_price=8,  quantity=2),
-        Item(id="sword_short",    name="Short Sword",    description="A dependable one-handed blade.",      base_price=50, quantity=2),
-        Item(id="dagger",         name="Iron Dagger",    description="Small, fast, concealable.",           base_price=20, quantity=3),
-        Item(id="armor_leather",  name="Leather Armor",  description="Lightweight protective vest.",        base_price=35, quantity=2),
-        Item(id="shield_wooden",  name="Wooden Shield",  description="Offers modest protection.",           base_price=15, quantity=2),
-        Item(id="food_bread",     name="Bread Loaf",     description="Fills the belly.",                    base_price=3,  quantity=5),
-        Item(id="food_cheese",    name="Hard Cheese",    description="Aged and pungent.",                   base_price=4,  quantity=4),
-        Item(id="trinket_ring",   name="Gold Ring",      description="A simple but fine ring.",             base_price=20, quantity=1),
-        Item(id="trinket_gem",    name="Amethyst Gem",   description="Deep purple, catches the light.",     base_price=40, quantity=1),
-        Item(id="rope",           name="Hemp Rope",      description="10 metres of sturdy rope.",           base_price=5,  quantity=3),
-        Item(id="torch",          name="Torch",          description="Burns for several hours.",            base_price=2,  quantity=8),
-    ]
+    catalog = load_item_catalog()
 
     for i, item in enumerate(catalog):
         if i >= len(shop_tiles):
@@ -111,6 +98,11 @@ def _default_actors() -> list[Actor]:
             y=5,
             gold=50,
             hp=100,
+            max_hp=100,
+            base_attack=8,
+            base_defense=3,
+            base_crit=0.05,
+            max_carry=8,
         ),
         Actor(
             id="shopkeeper_1",
@@ -120,6 +112,11 @@ def _default_actors() -> list[Actor]:
             y=3,
             gold=200,
             hp=80,
+            max_hp=80,
+            base_attack=4,
+            base_defense=2,
+            base_crit=0.05,
+            max_carry=6,
         ),
         Actor(
             id="player",
@@ -129,6 +126,11 @@ def _default_actors() -> list[Actor]:
             y=10,
             gold=0,
             hp=100,
+            max_hp=100,
+            base_attack=6,
+            base_defense=2,
+            base_crit=0.05,
+            max_carry=10,
         ),
     ]
 

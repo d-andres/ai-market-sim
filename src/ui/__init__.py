@@ -126,6 +126,24 @@ def register_pages(
 				_refresh_generation_status()
 				ui.timer(1.0, _refresh_generation_status)
 
+			# ── Static map preview (visible before generation completes) ──────
+			try:
+				from data.map import build_default_map
+				from data.map import render_ascii as _render_ascii
+				_preview_map = build_default_map()
+				_preview_ascii = _render_ascii(_preview_map, show_actors=False)
+				ui.label("MAP PREVIEW").style(
+					"font-family:'VT323',monospace;font-size:1.1rem;color:#555;"
+					"letter-spacing:0.1em;margin-top:12px;"
+				)
+				render_map_view(
+					ascii_map=_preview_ascii,
+					width=_preview_map.width,
+					height=_preview_map.height,
+				)
+			except Exception:
+				pass
+
 			return
 
 		ui.label("AI MARKET SIM").classes("sim-title")

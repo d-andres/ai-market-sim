@@ -30,6 +30,15 @@ class Item(BaseModel):
 	base_price: int = Field(ge=0)
 	quantity: int = Field(default=1, ge=0)
 	metadata: dict[str, str] = Field(default_factory=dict)
+	# ── Equipment stats (passive bonuses while equipped) ───────────────────
+	attack_bonus: int = Field(default=0, ge=0)
+	defense_bonus: int = Field(default=0, ge=0)
+	crit_bonus: float = Field(default=0.0, ge=0.0, le=1.0)
+	# ── Consumable effects (applied once on use) ────────────────────────────
+	hp_delta: int = 0          # HP change (positive = heal, negative = damage)
+	attack_delta: int = 0     # Permanent base_attack change
+	defense_delta: int = 0    # Permanent base_defense change
+	crit_delta: float = 0.0   # Permanent base_crit change
 
 
 class WorldItem(BaseModel):
@@ -127,11 +136,39 @@ class PlannedAction(BaseModel):
 	  - "wait"          → WaitParams
 	  - "converse"      → ConverseParams
 	  - "propose_trade" → ProposeTradeParams
+	  - "attack"        → AttackParams
+	  - "equip"         → EquipParams
+	  - "unequip"       → UnequipParams
+	  - "use_item"      → UseItemParams
 	"""
 
 	action_type: str
 	params: dict = Field(default_factory=dict)
 	reason: str = ""
+
+
+class AttackParams(BaseModel):
+	"""Params for the 'attack' action (melee, Chebyshev distance ≤ 1)."""
+
+	target_actor_id: str
+
+
+class EquipParams(BaseModel):
+	"""Params for the 'equip' action. Item moves from inventory into an equipment slot."""
+
+	item_id: str
+
+
+class UnequipParams(BaseModel):
+	"""Params for the 'unequip' action. Item returns from equipment slot to inventory."""
+
+	slot: str  # head | chest | legs | hand | offhand
+
+
+class UseItemParams(BaseModel):
+	"""Params for the 'use_item' action. Consume a consumable from inventory."""
+
+	item_id: str
 
 
 class Actor(BaseModel):
@@ -142,8 +179,29 @@ class Actor(BaseModel):
 	y: int = Field(ge=0)
 	gold: int = Field(default=0, ge=0)
 	hp: int = Field(default=100, ge=0)
+	max_hp: int = Field(default=100, ge=1)
+	# ── Combat base stats (before equipment bonuses) ───────────────────────
+	base_attack: int = Field(default=5, ge=0)
+	base_defense: int = Field(default=2, ge=0)
+	base_crit: float = Field(default=0.05, ge=0.0, le=1.0)
+	# ── Inventory and equipment ────────────────────────────────────────────
 	inventory: list[Item] = Field(default_factory=list)
-	# Reactive planning state
+	# Maximum number of item stacks the actor can carry on their person.
+	# Shelf items (WorldItem with owner_id == actor.id) are excluded from this count.
+	max_carry: int = Field(default=10, ge=1)
+	# Items in equipped slots are NOT in inventory. Equip moves item out of
+	# inventory; unequip moves it back. Slot names: head, chest, legs, hand, offhand.
+	# Two-handed weapons sit in the 'hand' slot and block the 'offhand' slot.
+	equipped: dict[str, Item | None] = Field(
+		default_factory=lambda: {
+			"head": None,
+			"chest": None,
+			"legs": None,
+			"hand": None,
+			"offhand": None,
+		}
+	)
+	# ── Reactive planning state ────────────────────────────────────────────
 	action_queue: list[PlannedAction] = Field(default_factory=list)
 	needs_replan: bool = Field(default=True)
 	interrupt_reason: str = ""
@@ -230,6 +288,10 @@ __all__ = [
 	"ProposeTradeParams",
 	"PickUpParams",
 	"PlaceParams",
+	"AttackParams",
+	"EquipParams",
+	"UnequipParams",
+	"UseItemParams",
 	"PlannedAction",
 	"Tile",
 	"Actor",

@@ -18,8 +18,12 @@ from typing import TYPE_CHECKING
 
 from src.models.schema import (
 	Actor,
+	AttackParams,
 	ConverseParams,
 	ConversationPacket,
+	EquipParams,
+	UnequipParams,
+	UseItemParams,
 	WorldItem,
 	Item,
 	Map,
@@ -455,6 +459,18 @@ class SimulationEngine:
 		elif action.action_type == "converse":
 			return self._execute_converse_action(actor, action)
 
+		elif action.action_type == "attack":
+			return self._execute_attack_action(actor, action)
+
+		elif action.action_type == "equip":
+			return self._execute_equip_action(actor, action)
+
+		elif action.action_type == "unequip":
+			return self._execute_unequip_action(actor, action)
+
+		elif action.action_type == "use_item":
+			return self._execute_use_item_action(actor, action)
+
 		else:
 			return f"Unknown action type: '{action.action_type}'"
 
@@ -484,6 +500,15 @@ class SimulationEngine:
 			owner = self._actor_by_id(target_gi.owner_id)
 			owner_name = owner.name if owner else target_gi.owner_id
 			reason = f"'{target_gi.item.name}' belongs to {owner_name} — propose a trade to acquire it"
+			self.interrupt_actor(actor.id, reason)
+			return reason
+
+		# Carry-capacity check
+		if self._carry_count(actor) >= actor.max_carry:
+			reason = (
+				f"{actor.name} is carrying too many items ({actor.max_carry}/{actor.max_carry}) "
+				"— drop or place something first"
+			)
 			self.interrupt_actor(actor.id, reason)
 			return reason
 
@@ -649,6 +674,242 @@ class SimulationEngine:
 			# No interrupt needed — conversations are non-critical events.
 
 		return f'{actor.name} → {target.name}: "{opening_line}" | {target.name}: "{reply}"'
+
+	def _execute_attack_action(self, actor: Actor, action: PlannedAction) -> str:
+		"""Execute a melee attack against a target actor."""
+		try:
+			p = AttackParams.model_validate(action.params)
+		except Exception as e:
+			reason = f"Invalid attack params: {e}"
+			self.interrupt_actor(actor.id, reason)
+			return reason
+
+		target = self._resolve_actor(p.target_actor_id)
+		if target is None:
+			reason = f"Attack target '{p.target_actor_id}' not found"
+			self.interrupt_actor(actor.id, reason)
+			return reason
+
+		dist = physics.distance_chebyshev(actor.x, actor.y, target.x, target.y)
+		if dist > physics.MELEE_RANGE:
+			reason = f"{target.name} is {dist} tiles away — move closer to attack"
+			self.interrupt_actor(actor.id, reason)
+			return reason
+
+		damage, is_crit = physics.calc_damage(actor, target)
+		target.hp = max(0, target.hp - damage)
+
+		crit_str = " (CRITICAL HIT!)" if is_crit else ""
+		desc = (
+			f"{actor.name} attacks {target.name} for {damage} damage{crit_str}! "
+			f"{target.name} HP: {target.hp}/{target.max_hp}"
+		)
+		self._log_event(actor.id, "attack", desc, {
+			"target_id": target.id,
+			"damage": damage,
+			"is_crit": is_crit,
+			"target_hp": target.hp,
+		})
+
+		if target.hp == 0:
+			self._handle_actor_death(target, killer=actor)
+
+		return desc
+
+	def _handle_actor_death(self, actor: Actor, killer: Actor | None = None) -> None:
+		"""Remove a dead actor: drop their inventory + equipped items and a corpse WorldItem.
+
+		- All personal inventory items land as unowned floor WorldItems at the actor's position.
+		- Equipped items are also dropped.
+		- A 'corpse' WorldItem (unique id, non-tradeable relic) is placed at the same tile.
+		- The actor is removed from world_map.actors.
+		- Other actors whose plans reference this actor will get an interrupt naturally
+		  the next time they try to target them.
+		"""
+		killer_name = killer.name if killer else "unknown causes"
+		death_desc = f"{actor.name} has been slain by {killer_name}!"
+		self._log_event(
+			actor.id, "death", death_desc,
+			{"killer_id": killer.id if killer else None, "x": actor.x, "y": actor.y},
+		)
+
+		# Drop all personal inventory items
+		for item in actor.inventory:
+			self.world_map.world_items.append(
+				WorldItem(item=item, x=actor.x, y=actor.y, owner_id=None)
+			)
+		actor.inventory.clear()
+
+		# Drop all equipped items
+		for slot, item in actor.equipped.items():
+			if item is not None:
+				self.world_map.world_items.append(
+					WorldItem(item=item, x=actor.x, y=actor.y, owner_id=None)
+				)
+				actor.equipped[slot] = None
+
+		# Drop a corpse marker
+		corpse_item = Item(
+			id=f"corpse_{actor.id}",
+			name=f"Corpse of {actor.name}",
+			description=(
+				f"The lifeless body of {actor.name}, slain by {killer_name}. "
+				"Grim testament to the dangers of this market."
+			),
+			base_price=0,
+			quantity=1,
+			metadata={"category": "corpse", "type": "body", "origin_id": actor.id},
+		)
+		self.world_map.world_items.append(
+			WorldItem(item=corpse_item, x=actor.x, y=actor.y, owner_id=None)
+		)
+
+		# Remove from simulation
+		self.world_map.actors = [a for a in self.world_map.actors if a.id != actor.id]
+		self.agent_brains.pop(actor.id, None)
+
+	def _carry_count(self, actor: Actor) -> int:
+		"""Number of item stacks the actor is carrying in personal inventory.
+
+		Shelf items (WorldItems with owner_id == actor.id) are NOT counted.
+		"""
+		return len(actor.inventory)
+
+	def _execute_equip_action(self, actor: Actor, action: PlannedAction) -> str:
+		"""Move an item from inventory into its equipment slot."""
+		try:
+			p = EquipParams.model_validate(action.params)
+		except Exception as e:
+			reason = f"Invalid equip params: {e}"
+			self.interrupt_actor(actor.id, reason)
+			return reason
+
+		# Find item in inventory
+		item = next((i for i in actor.inventory if i.id == p.item_id), None)
+		if item is None:
+			reason = f"{actor.name} does not have '{p.item_id}' in inventory"
+			self.interrupt_actor(actor.id, reason)
+			return reason
+
+		raw_slot = item.metadata.get("slot", "")
+		if not raw_slot:
+			reason = f"'{item.name}' has no equipment slot defined"
+			self.interrupt_actor(actor.id, reason)
+			return reason
+
+		# two_hand weapons occupy the 'hand' slot and clear 'offhand'
+		if raw_slot == "two_hand":
+			equip_slot = "hand"
+			# Return any existing offhand to inventory
+			old_offhand = actor.equipped.get("offhand")
+			if old_offhand is not None:
+				actor.inventory.append(old_offhand)
+				actor.equipped["offhand"] = None
+		else:
+			equip_slot = raw_slot
+
+		if equip_slot not in actor.equipped:
+			reason = f"Equipment slot '{equip_slot}' is not valid"
+			self.interrupt_actor(actor.id, reason)
+			return reason
+
+		# Block equipping an offhand while a two-hand weapon is in hand
+		if equip_slot == "offhand":
+			hand_item = actor.equipped.get("hand")
+			if hand_item is not None and hand_item.metadata.get("slot") == "two_hand":
+				reason = f"Cannot equip offhand while wielding two-handed {hand_item.name}"
+				self.interrupt_actor(actor.id, reason)
+				return reason
+
+		# Return any currently equipped item in that slot to inventory
+		old_item = actor.equipped.get(equip_slot)
+		if old_item is not None:
+			actor.inventory.append(old_item)
+
+		actor.inventory.remove(item)
+		actor.equipped[equip_slot] = item
+
+		desc = f"{actor.name} equipped {item.name} to {equip_slot} slot"
+		self._log_event(actor.id, "equip", desc, {"item_id": item.id, "slot": equip_slot})
+		return desc
+
+	def _execute_unequip_action(self, actor: Actor, action: PlannedAction) -> str:
+		"""Move an equipped item back to inventory."""
+		try:
+			p = UnequipParams.model_validate(action.params)
+		except Exception as e:
+			reason = f"Invalid unequip params: {e}"
+			self.interrupt_actor(actor.id, reason)
+			return reason
+
+		slot = p.slot
+		if slot not in actor.equipped:
+			reason = f"'{slot}' is not a valid equipment slot"
+			self.interrupt_actor(actor.id, reason)
+			return reason
+
+		item = actor.equipped.get(slot)
+		if item is None:
+			desc = f"{actor.name} has nothing in the {slot} slot"
+			return desc
+
+		actor.equipped[slot] = None
+		actor.inventory.append(item)
+
+		desc = f"{actor.name} unequipped {item.name} from {slot} slot"
+		self._log_event(actor.id, "unequip", desc, {"item_id": item.id, "slot": slot})
+		return desc
+
+	def _execute_use_item_action(self, actor: Actor, action: PlannedAction) -> str:
+		"""Consume a consumable item from inventory, applying its effects."""
+		try:
+			p = UseItemParams.model_validate(action.params)
+		except Exception as e:
+			reason = f"Invalid use_item params: {e}"
+			self.interrupt_actor(actor.id, reason)
+			return reason
+
+		item = next((i for i in actor.inventory if i.id == p.item_id), None)
+		if item is None:
+			reason = f"{actor.name} does not have '{p.item_id}' in inventory"
+			self.interrupt_actor(actor.id, reason)
+			return reason
+
+		category = item.metadata.get("category", "")
+		if category != "consumable":
+			reason = f"'{item.name}' is not a consumable item"
+			self.interrupt_actor(actor.id, reason)
+			return reason
+
+		effects = []
+
+		if item.hp_delta != 0:
+			old_hp = actor.hp
+			actor.hp = max(0, min(actor.max_hp, actor.hp + item.hp_delta))
+			actual = actor.hp - old_hp
+			if actual >= 0:
+				effects.append(f"+{actual} HP ({actor.hp}/{actor.max_hp})")
+			else:
+				effects.append(f"{actual} HP ({actor.hp}/{actor.max_hp})")
+
+		if item.attack_delta != 0:
+			actor.base_attack = max(0, actor.base_attack + item.attack_delta)
+			effects.append(f"attack {'+'if item.attack_delta>0 else ''}{item.attack_delta} → {actor.base_attack}")
+
+		if item.defense_delta != 0:
+			actor.base_defense = max(0, actor.base_defense + item.defense_delta)
+			effects.append(f"defense {'+'if item.defense_delta>0 else ''}{item.defense_delta} → {actor.base_defense}")
+
+		if item.crit_delta != 0.0:
+			actor.base_crit = max(0.0, min(1.0, actor.base_crit + item.crit_delta))
+			effects.append(f"crit {'+'if item.crit_delta>0 else ''}{item.crit_delta:.2f} → {actor.base_crit:.2f}")
+
+		actor.inventory.remove(item)
+
+		effects_str = ", ".join(effects) if effects else "no effect"
+		desc = f"{actor.name} used {item.name}: {effects_str}"
+		self._log_event(actor.id, "use_item", desc, {"item_id": item.id, "effects": effects})
+		return desc
 
 	def _execute_trade_action(self, actor: Actor, params: dict) -> str:
 		"""Execute a propose_trade action step."""
@@ -854,6 +1115,19 @@ class SimulationEngine:
 		for item in proposal.offered_items:
 			if item.id not in proposer_carried:
 				return f"{proposer.name} no longer has {item.name}."
+
+		# Carry-capacity checks before committing the transfer
+		items_proposer_gains = len(proposal.requested_items)
+		items_target_gains = len(proposal.offered_items)
+		proposer_free = proposer.max_carry - self._carry_count(proposer)
+		target_free = target.max_carry - self._carry_count(target)
+		# Adjust for items leaving each inventory
+		proposer_net = items_proposer_gains - len(proposal.offered_items)
+		target_net = items_target_gains - len(proposal.requested_items)
+		if proposer_net > proposer_free:
+			return f"{proposer.name} doesn't have enough carry space for this trade."
+		if target_net > target_free:
+			return f"{target.name} doesn't have enough carry space for this trade."
 
 		# Requested items may be in target's carried inventory OR on their shelf
 		target_carried = {item.id: item for item in target.inventory}
