@@ -7,7 +7,6 @@ on purpose: all domain logic lives in ``data/`` and (later) ``src/agents/``.
 
 import os
 import threading
-import time
 from threading import Lock
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -63,7 +62,6 @@ _runtime_state = {
     "initial_plan_expected": 0,
     "initial_plan_completed": 0,
     "block_on_initial_plans": True,
-    "paused": True,
 }
 
 
@@ -200,9 +198,10 @@ def generate_world() -> None:
             world_map,
             tick_rate=float(os.getenv("TICK_RATE", "2.0")),
             enable_ai=_env_bool("ENABLE_AI", True),
-            ollama_model=os.getenv("LLM_MODEL", "ollama/llama3.2"),
+            ollama_model=os.getenv("LLM_MODEL", "qwen3:4b"),
             ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
         )
+        engine.replan_interval = int(os.getenv("REPLAN_INTERVAL", "10"))
 
         # Warm up mode:
         # - default (blocking): wait for all initial plans before world becomes ready
@@ -241,8 +240,16 @@ def generate_world() -> None:
                             thought_summary = f"{actor.name} failed to generate an initial plan and will retry in simulation."
 
                         actor.action_queue = plan
-                        actor.needs_replan = False
-                        actor.interrupt_reason = ""
+                        # If warm-up produced only wait actions (fallback), mark
+                        # for immediate critical replan so the tick loop submits
+                        # a real plan at tick 0 instead of deferring 23 ticks.
+                        is_fallback = all(a.action_type == "wait" for a in plan)
+                        if is_fallback:
+                            actor.needs_replan = True
+                            actor.interrupt_reason = "initial plan was low quality"
+                        else:
+                            actor.needs_replan = False
+                            actor.interrupt_reason = ""
                         engine._log_event(
                             actor_id=actor.id,
                             event_type="plan",
@@ -273,7 +280,6 @@ def generate_world() -> None:
             _runtime_state["error"] = ""
             _runtime_state["initial_plan_expected"] = 0
             _runtime_state["initial_plan_completed"] = 0
-            _runtime_state["paused"] = False
     except Exception as exc:  # noqa: BLE001
         with _runtime_lock:
             _runtime_state["ready"] = False
@@ -291,7 +297,7 @@ def start_generation() -> None:
 
 
 def advance_tick() -> None:
-    """Advance the simulation by one tick (used by the UI button and auto-loop)."""
+    """Advance the simulation by one tick (manual only)."""
     with _runtime_lock:
         engine = _runtime_state["engine"]
     if engine is None:
@@ -299,35 +305,22 @@ def advance_tick() -> None:
     engine.tick()
 
 
-def _tick_loop() -> None:
-    """Background thread: advances the simulation at the configured tick rate."""
-    while True:
-        with _runtime_lock:
-            engine = _runtime_state["engine"]
-            ready = bool(_runtime_state["ready"])
-            paused = bool(_runtime_state["paused"])
-        try:
-            if ready and engine is not None and not paused:
-                engine.tick()
-        except Exception:  # noqa: BLE001 — keep the loop alive on errors
-            pass
-        time.sleep(engine.tick_rate if engine is not None else 0.5)
-
-
-_ticker = threading.Thread(target=_tick_loop, daemon=True)
-_ticker.start()
-
-
-def is_paused() -> bool:
-    """Return True when the simulation is paused."""
+def get_replan_interval() -> int:
+    """Return the current replan interval (ticks between AI plan revisions)."""
     with _runtime_lock:
-        return bool(_runtime_state["paused"])
+        engine = _runtime_state["engine"]
+    if engine is None:
+        return int(os.getenv("REPLAN_INTERVAL", "10"))
+    return engine.replan_interval
 
 
-def set_paused(paused: bool) -> None:
-    """Pause or resume the simulation tick loop."""
+def set_replan_interval(interval: int) -> None:
+    """Set how many ticks between AI plan revisions."""
+    interval = max(1, int(interval))
     with _runtime_lock:
-        _runtime_state["paused"] = paused
+        engine = _runtime_state["engine"]
+    if engine is not None:
+        engine.replan_interval = interval
 
 
 def get_world_snapshot() -> dict:
@@ -357,7 +350,13 @@ def get_world_snapshot() -> dict:
             "actors": [],
             "recent_events": [],
             "llm_calls": 0,
+            "llm_responses": 0,
+            "llm_timeouts": 0,
+            "llm_avg_duration": 0.0,
+            "llm_total_duration": 0.0,
             "llm_pending_actors": [],
+            "llm_request_log": [],
+            "actor_conversation_logs": {},
         }
 
     # Compute physics data for each actor.
@@ -447,14 +446,21 @@ def get_world_snapshot() -> dict:
         ],
         "recent_events": engine.get_event_log(limit=200),
         "llm_calls": engine.llm_call_count,
+        "llm_responses": engine.llm_response_count,
+        "llm_timeouts": engine.llm_timeout_count,
+        "llm_avg_duration": round(engine.llm_total_duration / max(engine.llm_response_count + engine.llm_timeout_count, 1), 2),
+        "llm_total_duration": round(engine.llm_total_duration, 2),
         "llm_pending_actors": list(engine.llm_pending_actors),
+        "llm_request_log": list(engine.llm_request_log),
+        "actor_conversation_logs": engine.get_actor_conversation_logs(),
     }
 
 
 register_pages(
     get_world_snapshot,
-    is_paused=is_paused,
-    set_paused=set_paused,
+    advance_tick=advance_tick,
+    get_replan_interval=get_replan_interval,
+    set_replan_interval=set_replan_interval,
     is_world_ready=is_world_ready,
     start_generation=start_generation,
     get_generation_status=get_generation_status,

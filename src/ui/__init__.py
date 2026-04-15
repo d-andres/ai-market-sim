@@ -1,7 +1,6 @@
 """NiceGUI user interface components and page registration."""
 
 from collections.abc import Callable
-import html
 import json
 
 from fastapi import Request
@@ -62,8 +61,9 @@ _PAGE_CSS = """
 
 def register_pages(
 	get_world_snapshot: Callable[[], dict],
-	is_paused: Callable[[], bool] | None = None,
-	set_paused: Callable[[bool], None] | None = None,
+	advance_tick: Callable[[], None] | None = None,
+	get_replan_interval: Callable[[], int] | None = None,
+	set_replan_interval: Callable[[int], None] | None = None,
 	is_world_ready: Callable[[], bool] | None = None,
 	start_generation: Callable[[], None] | None = None,
 	get_generation_status: Callable[[], dict] | None = None,
@@ -155,17 +155,20 @@ def register_pages(
 
 		world_state = get_world_snapshot()
 
-		# ── Play / Pause toggle ────────────────────────────────────────────────
-		_play_btn: dict = {"el": None}
+		# ── Manual tick + replan interval controls ─────────────────────────────
+		def _do_tick() -> None:
+			if advance_tick is not None:
+				advance_tick()
+				refresh_map()
 
-		def _toggle_pause() -> None:
-			if is_paused is None or set_paused is None:
-				return
-			new_paused = not is_paused()
-			set_paused(new_paused)
-			btn = _play_btn["el"]
-			if btn is not None:
-				btn.set_text("▶ PLAY" if new_paused else "⏸ PAUSE")
+		def _on_replan_change(e) -> None:
+			if set_replan_interval is not None:
+				try:
+					val = int(e.value)
+					if val >= 1:
+						set_replan_interval(val)
+				except (ValueError, TypeError):
+					pass
 
 		# ── Controls + status bar (above the map) ──────────────────────────────
 		with ui.card().classes("w-full"):
@@ -173,23 +176,43 @@ def register_pages(
 				tick_label = ui.label(
 					f"Tick: {world_state['tick']} | Time: {world_state['elapsed_time_formatted']}"
 				).style("font-family:'VT323',monospace;font-size:1.5rem;color:#d4a017;flex:1;letter-spacing:0.05em")
-				llm_label = ui.label(
-					f"LLM calls: {world_state.get('llm_calls', 0)}"
-				).style("font-family:'VT323',monospace;font-size:1rem;color:#f0a500;background:#1a1200;padding:2px 10px;border-radius:3px;border:1px solid #3a2a00")
 				thinking_label = ui.label("").style(
 					"font-family:'VT323',monospace;font-size:1rem;color:#00bcd4;background:#001a1f;padding:2px 10px;border-radius:3px;border:1px solid #004d5a"
 				)
-				status_label = ui.label("PAUSED").style(
+				status_label = ui.label("READY").style(
 					"font-family:'VT323',monospace;font-size:1rem;color:#4caf50;letter-spacing:0.05em"
 				)
-				if is_paused is not None and set_paused is not None:
-					_initial_paused = is_paused()
-					_play_btn["el"] = ui.button(
-						"▶ PLAY" if _initial_paused else "⏸ PAUSE",
-						on_click=_toggle_pause,
+			with ui.row().classes("w-full items-center gap-4 flex-wrap"):
+				if advance_tick is not None:
+					ui.button(
+						"⏭ NEXT TICK",
+						on_click=_do_tick,
 					).style(
-						"font-family:'VT323',monospace;font-size:1.1rem;background:#0d200d;color:#4caf50;border:1px solid #2d6a2d;"
+						"font-family:'VT323',monospace;font-size:1.2rem;background:#0d200d;color:#4caf50;border:1px solid #2d6a2d;"
+					).props("unelevated")
+					ui.label("(Space)").style(
+						"font-family:'VT323',monospace;font-size:0.9rem;color:#555;"
 					)
+				if get_replan_interval is not None and set_replan_interval is not None:
+					ui.label("Replan every").style(
+						"font-family:'VT323',monospace;font-size:1.05rem;color:#7a7a7a;"
+					)
+					ui.number(
+						value=get_replan_interval(),
+						min=1,
+						max=999,
+						step=1,
+						on_change=_on_replan_change,
+					).props("dense").style(
+						"width:70px;font-family:'VT323',monospace;"
+					)
+					ui.label("ticks").style(
+						"font-family:'VT323',monospace;font-size:1.05rem;color:#7a7a7a;"
+					)
+
+		# Keyboard shortcut: Space to advance tick
+		if advance_tick is not None:
+			ui.keyboard(on_key=lambda e: _do_tick() if e.key == ' ' and e.action.keydown else None)
 
 		# ── Map ────────────────────────────────────────────────────────────────
 		map_label = render_map_view(
@@ -270,17 +293,18 @@ def register_pages(
 						etype = str(e.get("event_type", ""))
 						color = _event_color(etype)
 						tick = int(e.get("tick", 0))
-						actor_id = html.escape(str(e.get("actor_id", "?")))
-						desc = html.escape(str(e.get("description", "")))
-						etype_label = html.escape(etype.upper())
-						ui.html(
-							f'<div style="font-family:\'VT323\',monospace;font-size:1.1rem;line-height:1.3;white-space:pre-wrap;">'
-							f'<span style="color:#6a6a6a;">[{tick:03d}]</span> '
-							f'<span style="color:#8a8a8a;">{actor_id}</span> '
-							f'<span style="color:{color};">[{etype_label}]</span> '
-							f'<span style="color:{color};">{desc}</span>'
-							"</div>"
-						)
+						actor_id = str(e.get("actor_id", "?"))
+						desc = str(e.get("description", ""))
+						etype_label = etype.upper()
+						with ui.row().classes("w-full items-baseline gap-1").style(
+							"font-family:'VT323',monospace;font-size:1.1rem;line-height:1.3;"
+						):
+							ui.label(f"[{tick:03d}]").style("color:#6a6a6a !important;")
+							ui.label(actor_id).style("color:#8a8a8a !important;")
+							ui.label(f"[{etype_label}]").style(f"color:{color} !important;")
+							ui.label(desc).classes("flex-1").style(
+								f"color:{color} !important;white-space:pre-wrap;"
+							)
 				ui.run_javascript(
 					f"""
 					(() => {{
@@ -292,12 +316,169 @@ def register_pages(
 
 			_render_event_log(world_state.get("recent_events", []))
 
+		# ── LLM Metrics ───────────────────────────────────────────────────────
+		_llm_metric_style = "font-family:'VT323',monospace;font-size:1.1rem;padding:2px 10px;border-radius:3px;"
+		with ui.card().classes("w-full mt-3"):
+			ui.label("LLM METRICS").classes("sim-section-title")
+			with ui.row().classes("w-full items-center gap-3 flex-wrap"):
+				llm_requests_label = ui.label(
+					f"Requests: {world_state.get('llm_calls', 0)}"
+				).style(_llm_metric_style + "color:#f0a500;background:#1a1200;border:1px solid #3a2a00;")
+				llm_responses_label = ui.label(
+					f"Responses: {world_state.get('llm_responses', 0)}"
+				).style(_llm_metric_style + "color:#4caf50;background:#0d200d;border:1px solid #2d6a2d;")
+				llm_timeouts_label = ui.label(
+					f"Timeouts: {world_state.get('llm_timeouts', 0)}"
+				).style(_llm_metric_style + "color:#ff6b6b;background:#1a0000;border:1px solid #4d0000;")
+				llm_duration_label = ui.label(
+					f"Avg Duration: {world_state.get('llm_avg_duration', 0.0)}s"
+				).style(_llm_metric_style + "color:#00bcd4;background:#001a1f;border:1px solid #004d5a;")
+
+			# ── LLM Request/Response Feed ──────────────────────────────────────
+			with ui.expansion("LLM REQUEST / RESPONSE FEED", value=False).classes("w-full mt-2"):
+				llm_feed_id = "llm-feed"
+				llm_feed = ui.column().props(f"id={llm_feed_id}").classes("w-full gap-0").style(
+					"height:250px;overflow:auto;background:#080808;border:1px solid #1d1d1d;padding:6px;"
+				)
+
+			def _render_llm_feed(log_entries: list[dict]) -> None:
+				llm_feed.clear()
+				with llm_feed:
+					for entry in log_entries[-50:]:
+						tick = entry.get("tick", 0)
+						actor = entry.get("actor", "?")
+						status = entry.get("status", "?")
+						duration = entry.get("duration", 0)
+						request_text = entry.get("request", "")
+						response_text = entry.get("response", "")
+						status_color = {"ok": "#4caf50", "error": "#ff6b6b", "timeout": "#ffa94d"}.get(status, "#888")
+						with ui.column().classes("w-full gap-0").style(
+							"border-bottom:1px solid #1d1d1d;padding:4px 0;"
+						):
+							with ui.row().classes("w-full items-baseline gap-1").style(
+								"font-family:'VT323',monospace;font-size:1.05rem;line-height:1.3;"
+							):
+								ui.label(f"[{tick:03d}]").style("color:#6a6a6a !important;")
+								ui.label(actor).style("color:#8a8a8a !important;")
+								ui.label(f"[{status.upper()}]").style(f"color:{status_color} !important;")
+								ui.label(f"{duration}s").style("color:#00bcd4 !important;")
+							ui.label(f"REQ: {request_text}").style(
+								"font-family:'VT323',monospace;font-size:0.95rem;color:#b197fc !important;white-space:pre-wrap;padding-left:8px;"
+							)
+							ui.label(f"RES: {response_text}").style(
+								"font-family:'VT323',monospace;font-size:0.95rem;color:#74c0fc !important;white-space:pre-wrap;padding-left:8px;"
+							)
+
+			_render_llm_feed(world_state.get("llm_request_log", []))
+
+		# ── Per-Actor LLM Thought Log ─────────────────────────────────────────
+		_call_type_colors = {
+			"plan":            "#b197fc",
+			"fallback_plan":   "#ff9d00",
+			"fallback_policy": "#ffe600",
+			"health_check":    "#39ff14",
+			"trade_eval":      "#4ecdc4",
+			"conversation":    "#8ecae6",
+			"social_impact":   "#f3c969",
+		}
+		with ui.card().classes("w-full mt-3"):
+			ui.label("ACTOR THOUGHT LOG").classes("sim-section-title")
+			ui.label("Per-actor LLM conversation history with thinking/reasoning content.").style(
+				"font-family:'VT323',monospace;font-size:1rem;color:#444"
+			)
+			actor_thought_container = ui.column().classes("w-full gap-0")
+		# Track entry counts per actor so we only re-render when something new arrives.
+		_thought_log_counts: dict[str, int] = {}
+
+		def _render_actor_thoughts(conversation_logs: dict[str, list[dict]]) -> None:
+			# Skip re-render if nothing new has been logged — preserves expansion state.
+			new_counts = {name: len(entries) for name, entries in conversation_logs.items()}
+			if new_counts == _thought_log_counts:
+				return
+			_thought_log_counts.clear()
+			_thought_log_counts.update(new_counts)
+			actor_thought_container.clear()
+			with actor_thought_container:
+				if not conversation_logs:
+					ui.label("No LLM calls recorded yet.").style(
+						"font-family:'VT323',monospace;font-size:1rem;color:#333"
+					)
+					return
+				for actor_name, entries in sorted(conversation_logs.items()):
+					if not entries:
+						continue
+					last = entries[-1]
+					has_thinking = any(e.get("thinking") for e in entries)
+					header = f"{actor_name}  ({len(entries)} calls)"
+					if has_thinking:
+						header += " 🧠"
+					with ui.expansion(header, value=False).classes("w-full"):
+						thought_scroll_id = f"thoughts-{actor_name.replace(' ', '-')}"
+						with ui.column().props(f"id={thought_scroll_id}").classes("w-full gap-0").style(
+							"max-height:400px;overflow:auto;background:#080808;border:1px solid #1d1d1d;padding:6px;"
+						):
+							for entry in entries:
+								tick = entry.get("tick", 0)
+								call_type = entry.get("call_type", "?")
+								prompt = entry.get("prompt", "")
+								thinking = entry.get("thinking", "")
+								response = entry.get("response", "")
+								duration = entry.get("duration", 0)
+								type_color = _call_type_colors.get(call_type, "#888")
+
+								with ui.column().classes("w-full gap-0").style(
+									"border-bottom:1px solid #1d1d1d;padding:6px 0;"
+								):
+									# Header: tick + call type + duration
+									with ui.row().classes("w-full items-baseline gap-2").style(
+										"font-family:'VT323',monospace;font-size:1.1rem;line-height:1.3;"
+									):
+										ui.label(f"[{tick:03d}]").style("color:#6a6a6a !important;")
+										ui.label(f"[{call_type.upper()}]").style(f"color:{type_color} !important;")
+										ui.label(f"{duration}s").style("color:#00bcd4 !important;")
+
+									# Prompt (truncated, expandable)
+									prompt_preview = prompt[:200] + ("..." if len(prompt) > 200 else "")
+									with ui.expansion("PROMPT", value=False).classes("w-full").style(
+										"font-family:'VT323',monospace;"
+									):
+										ui.label(prompt).style(
+											"font-family:'VT323',monospace;font-size:0.9rem;color:#b197fc !important;"
+											"white-space:pre-wrap;word-break:break-word;padding:4px;"
+										)
+
+									# Thinking (the key feature)
+									if thinking:
+										with ui.expansion("THINKING", value=False).classes("w-full").style(
+											"font-family:'VT323',monospace;"
+										):
+											ui.label(thinking).style(
+												"font-family:'VT323',monospace;font-size:0.9rem;color:#ff6ec7 !important;"
+												"white-space:pre-wrap;word-break:break-word;padding:4px;"
+												"background:#1a0020;border-left:3px solid #ff6ec7;"
+											)
+
+									# Response
+									with ui.expansion("RESPONSE", value=False).classes("w-full").style(
+										"font-family:'VT323',monospace;"
+									):
+										ui.label(response).style(
+											"font-family:'VT323',monospace;font-size:0.9rem;color:#74c0fc !important;"
+											"white-space:pre-wrap;word-break:break-word;padding:4px;"
+										)
+
+		_render_actor_thoughts(world_state.get("actor_conversation_logs", {}))
+
 		def refresh_map() -> None:
 			snapshot = get_world_snapshot()
 			update_map_view(map_label, snapshot["ascii"])
 			json_label.set_text(json.dumps(snapshot, indent=2))
 			tick_label.set_text(f"Tick: {snapshot['tick']} | Time: {snapshot['elapsed_time_formatted']}")
-			llm_label.set_text(f"LLM calls: {snapshot.get('llm_calls', 0)}")
+			# LLM metrics
+			llm_requests_label.set_text(f"Requests: {snapshot.get('llm_calls', 0)}")
+			llm_responses_label.set_text(f"Responses: {snapshot.get('llm_responses', 0)}")
+			llm_timeouts_label.set_text(f"Timeouts: {snapshot.get('llm_timeouts', 0)}")
+			llm_duration_label.set_text(f"Avg Duration: {snapshot.get('llm_avg_duration', 0.0)}s")
 			pending = snapshot.get("llm_pending_actors", [])
 			if pending:
 				names = ", ".join(pending)
@@ -307,14 +488,13 @@ def register_pages(
 			else:
 				thinking_label.set_text("")
 				thinking_label.set_visibility(False)
-				paused = is_paused() if is_paused is not None else True
-				status_label.set_text("PAUSED" if paused else "✓ UPDATED")
-			# Keep play/pause button label in sync
-			btn = _play_btn["el"]
-			if btn is not None and is_paused is not None:
-				btn.set_text("▶ PLAY" if is_paused() else "⏸ PAUSE")
+				status_label.set_text("✓ READY")
 			# Re-render filtered/colorized events each refresh.
 			_render_event_log(snapshot.get("recent_events", []))
+			# Re-render LLM feed.
+			_render_llm_feed(snapshot.get("llm_request_log", []))
+			# Re-render per-actor thought logs.
+			_render_actor_thoughts(snapshot.get("actor_conversation_logs", {}))
 
 		# ── State inspector ────────────────────────────────────────────────────
 		with ui.card().classes("w-full mt-3"):

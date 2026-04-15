@@ -4,7 +4,7 @@ This guide explains how LLM-powered AI agents work in ai-market-sim. Actors (Gua
 
 ## Architecture
 
-Each actor's `AgentBrain` (`src/agents/brain.py`) wraps a **LiteLLMModel** from `smolagents[litellm]`. This supports any backend that LiteLLM can route to — Ollama, OpenAI, Anthropic, etc. There is no `CodeAgent`; all LLM calls are direct `ChatMessage` requests with structured response parsing.
+Each actor's `AgentBrain` (`src/agents/brain.py`) uses `OllamaClient` (`src/agents/ollama_client.py`) to call the local Ollama server directly via HTTP. This captures both the model's visible response and its internal thinking/reasoning content (for models like qwen3, deepseek-r1, etc.). All LLM calls are `ChatMessage` requests with structured response parsing — no agent framework is involved.
 
 ### Planning Flow
 
@@ -75,13 +75,13 @@ ollama pull qwen3:4b    # or any model: llama3.2, mistral, phi3
 
 Copy `.env.example` to `.env`:
 ```env
-LLM_MODEL=ollama/qwen3:4b
+LLM_MODEL=qwen3:4b
 OLLAMA_BASE_URL=http://localhost:11434
 ENABLE_AI=true
 TICK_RATE=2.0
 ```
 
-Model name format: always prefix with `ollama/` (e.g., `ollama/qwen3:4b`, `ollama/llama3.2`).
+Model name format: use the Ollama model name directly (e.g., `qwen3:4b`, `llama3.2`, `mistral`). An `ollama/` prefix is stripped automatically if present.
 
 ## Cloudflared Tunnel (Hugging Face Spaces)
 
@@ -136,5 +136,5 @@ ollama list
 
 ### Agents making illogical moves
 - Check system prompts in `src/agents/prompts.py`
-- Try a more capable model (`ollama/mistral`, `ollama/llama3.2`)
+- Try a more capable model (`mistral`, `llama3.2`)
 - Verify agent can see targets (default vision range: 10 tiles)

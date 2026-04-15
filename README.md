@@ -9,7 +9,7 @@ pinned: false
 
 # ai-market-sim
 
-Tile-based fantasy market simulation where autonomous AI agents (guards, shopkeepers, players) live, trade, fight, and negotiate inside a persistent physical world. Every action — movement, combat, item use, conversation — is governed by spatial coordinates, field-of-vision, and real-time inventory management. AI brains are powered by LLMs via Ollama/LiteLLM.
+Tile-based fantasy market simulation where autonomous AI agents (guards, shopkeepers, players) live, trade, fight, and negotiate inside a persistent physical world. Every action — movement, combat, item use, conversation — is governed by spatial coordinates, field-of-vision, and real-time inventory management. AI brains are powered by LLMs via a local Ollama server.
 
 ## Features
 
@@ -50,7 +50,7 @@ Copy `.env.example` to `.env` and configure:
 
 | Variable | Default | Description |
 |---|---|---|
-| `LLM_MODEL` | `ollama/llama3.2` | LiteLLM model identifier |
+| `LLM_MODEL` | `qwen3:4b` | Ollama model name |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama API endpoint |
 | `ENABLE_AI` | `true` | Toggle AI brains on/off |
 | `TICK_RATE` | `2.0` | Seconds per simulation tick |
@@ -84,6 +84,7 @@ python tests/test_movement_physics.py
 python tests/test_response_parser.py
 python tests/test_goal_fallback.py
 python tests/test_initial_warmup_response.py
+python tests/test_ollama_client.py
 ```
 
-75 tests total — no LLM calls required (AI disabled in test harnesses).
+122+ tests — no LLM calls required (AI disabled in test harnesses). 4 live LLM tests skipped by default.

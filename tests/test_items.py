@@ -78,10 +78,10 @@ def _engine(world_map: Map) -> SimulationEngine:
 # ---------------------------------------------------------------------------
 
 def test_shelf_item_visible_in_observation():
-    """An actor should see a shopkeeper's shelf item in the observation output."""
+    """An actor should see a shopkeeper's shelf item when within discovery range (dist <= 2)."""
     world_map = _make_map()
     sk = _shopkeeper(x=3, y=3)
-    player = _player(x=4, y=4)
+    player = _player(x=2, y=2)  # within DISCOVERY_RANGE (dist 1 to shop tile at 1,1)
     world_map.actors = [sk, player]
 
     # Place a potion on shelf tile (1,1) owned by shopkeeper
@@ -99,6 +99,29 @@ def test_shelf_item_visible_in_observation():
     assert "carrying/selling" in output, f"Expected carrying/selling label:\n{output}"
     print("PASS  test_shelf_item_visible_in_observation")
     return output
+
+
+def test_shelf_item_hidden_when_far():
+    """Shop shelf items on the ground should show as hidden when actor is beyond discovery range."""
+    world_map = _make_map()
+    # Shopkeeper far away so their carrying/selling section is not visible either
+    sk = _shopkeeper(x=1, y=1)
+    player = _player(x=5, y=5)  # dist 4 to shelf at (1,1) — beyond DISCOVERY_RANGE
+    world_map.actors = [sk, player]
+
+    potion = _potion()
+    world_map.world_items = [WorldItem(item=potion, x=1, y=1, owner_id=sk.id)]
+
+    memory = RelationshipMemory()
+    obs_tool = ObserveSurroundingsTool(actor=player, world_map=world_map, memory=memory)
+    output = obs_tool.forward(vision_range=10)
+
+    assert "move closer to inspect" in output.lower(), f"Expected hidden shelf message:\n{output}"
+    # Item name should only appear in the carrying/selling section (if shopkeeper visible within range)
+    # but NOT in the ground items section
+    ground_section = output.split("Items in view")[1] if "Items in view" in output else ""
+    assert "Health Potion" not in ground_section, f"Item details should be hidden in ground items at distance:\n{output}"
+    print("PASS  test_shelf_item_hidden_when_far")
 
 
 # ---------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-"""Agent brain: LLM-driven decision making using Smolagents.
+"""Agent brain: LLM-driven decision making via Ollama.
 
 This module connects actors to their AI "brains" which can:
 - Observe the world around them (including visible inventories)
@@ -6,7 +6,7 @@ This module connects actors to their AI "brains" which can:
 - Propose and evaluate trades using LLM judgment
 - Move and act in the world
 
-Supports multiple LLM providers via LiteLLM (Ollama, OpenAI, Anthropic, etc.).
+Uses the local Ollama server for all LLM inference.
 See AI-AGENT-INTEGRATION.md for setup instructions.
 """
 
@@ -17,8 +17,7 @@ import json
 import re
 from typing import TYPE_CHECKING
 
-from smolagents import Tool, LiteLLMModel, ChatMessage, MessageRole
-
+from src.agents.ollama_client import OllamaClient, ChatMessage, MessageRole
 from src.models.schema import Actor, ActorRole, Map, PlannedAction, TradeProposal
 from src.simulation import physics
 from src.agents.prompts import (
@@ -94,24 +93,8 @@ class RelationshipMemory:
 # Tools
 # ---------------------------------------------------------------------------
 
-class ObserveSurroundingsTool(Tool):
-	"""Tool for an actor to observe their surroundings, including nearby inventories."""
-	
-	name = "observe_surroundings"
-	description = (
-		"Observe your surroundings. Returns your position, visible actors and their "
-		"inventories, nearby shops, and a summary of your own gold and inventory. "
-		"Use this before deciding whether to propose a trade."
-	)
-	inputs = {
-		"vision_range": {
-			"type": "integer",
-			"description": "How far to look (in tiles). Default is 10.",
-			"default": 10,
-			"nullable": True,
-		}
-	}
-	output_type = "string"
+class ObserveSurroundingsTool:
+	"""Builds a text description of an actor's surroundings for LLM prompts."""
 	
 	def __init__(
 		self,
@@ -119,9 +102,7 @@ class ObserveSurroundingsTool(Tool):
 		world_map: Map,
 		memory: RelationshipMemory,
 		engine: SimulationEngine | None = None,
-		**kwargs,
 	):
-		super().__init__(**kwargs)
 		self.actor = actor
 		self.world_map = world_map
 		self.memory = memory
@@ -164,13 +145,17 @@ class ObserveSurroundingsTool(Tool):
 					self.actor.x, self.actor.y, other.x, other.y
 				)
 				# Effective inventory = carried + shelf items owned by this actor
-				eff_items = list(other.inventory) + [
-					gi.item for gi in self.world_map.world_items if gi.owner_id == other.id
-				]
-				inv_str = (
-					", ".join(f"{i.name} (id:{i.id}, base {i.base_price}g) x{i.quantity}" for i in eff_items)
-					if eff_items else "nothing visible"
-				)
+				# Only visible when within conversation/trade range
+				if dist <= CONVERSATION_RANGE:
+					eff_items = list(other.inventory) + [
+						gi.item for gi in self.world_map.world_items if gi.owner_id == other.id
+					]
+					inv_str = (
+						", ".join(f"{i.name} (id:{i.id}, base {i.base_price}g) x{i.quantity}" for i in eff_items)
+						if eff_items else "nothing visible"
+					)
+				else:
+					inv_str = "(too far to see details)"
 				# Compute explicit move direction so the LLM never has to guess
 				dx = other.x - self.actor.x
 				dy = other.y - self.actor.y
@@ -194,6 +179,9 @@ class ObserveSurroundingsTool(Tool):
 			lines.append("\nNo other actors visible.")
 
 		# Ground/shelf items in view (owned shelf items can be stolen)
+		# Items at shop tiles owned by other actors are hidden until the actor
+		# is adjacent (dist <= 2) — actors must explore to discover shop inventory.
+		DISCOVERY_RANGE = 2
 		visible_set = set(viewport.visible_tiles)
 		visible_gis = [
 			gi for gi in self.world_map.world_items
@@ -210,6 +198,12 @@ class ObserveSurroundingsTool(Tool):
 				by_pos.setdefault((gi.x, gi.y), []).append(gi)
 			for (gx, gy), gis in sorted(by_pos.items()):
 				dist = physics.distance_chebyshev(self.actor.x, self.actor.y, gx, gy)
+				tile = self.world_map.tile_at(gx, gy)
+				is_shop_tile = tile.tile_type.value == "shop"
+				# Hide shop item details if the actor is too far away to inspect
+				if is_shop_tile and dist > DISCOVERY_RANGE:
+					lines.append(f"  - ({gx},{gy}) dist {dist}: [Shop shelf — move closer to inspect items]")
+					continue
 				item_strs = []
 				for gi in gis:
 					is_corpse = gi.item.metadata.get("category") == "corpse"
@@ -255,18 +249,19 @@ class AgentBrain:
 	"""
 
 	# How many steps the LLM is asked to plan at once.
-	PLAN_HORIZON: int = 30
+	# Set high enough so actors have actions to execute between replan intervals.
+	PLAN_HORIZON: int = 20
 	# AI-authored fallback profile refresh cadence and fallback planning budget.
 	FALLBACK_POLICY_TTL_TICKS: int = 40
 	FALLBACK_PLAN_HORIZON: int = 10
-	FALLBACK_MAX_ATTEMPTS: int = 2
+	FALLBACK_MAX_ATTEMPTS: int = 1
 
 	def __init__(
 		self,
 		actor: Actor,
 		world_map: Map,
 		engine: SimulationEngine,
-		model_name: str = "ollama/llama3.2",
+		model_name: str = "qwen3:4b",
 		api_base: str = "http://localhost:11434",
 	):
 		self.actor = actor
@@ -274,13 +269,79 @@ class AgentBrain:
 		self.engine = engine
 		self.memory = RelationshipMemory()
 
-		self.model = LiteLLMModel(model_id=model_name, api_base=api_base)
+		# Thinking mode is enabled so the model separates its reasoning (hidden
+		# in the ``thinking`` field) from the structured JSON output (in
+		# ``content``).  With ``think=False`` qwen3 dumps verbose reasoning
+		# directly into the content, making JSON extraction unreliable.
+		# max_tokens must be large enough for both thinking + content tokens.
+		# A generous timeout (300s) accommodates concurrent requests queuing
+		# behind each other on the Ollama server.
+		self.model = OllamaClient(
+			model_id=model_name,
+			api_base=api_base,
+			timeout=300,
+			max_tokens=8192,
+			num_ctx=4096,
+			think=True,
+		)
 		self.system_prompt = get_system_prompt_for_role(actor.role)
 		self.obs_tool = ObserveSurroundingsTool(
 			actor=actor, world_map=world_map, memory=self.memory, engine=engine
 		)
 		self._adaptive_fallback_policy: dict | None = None
 		self._adaptive_fallback_policy_tick: int = -10_000
+		# Metrics: last request/response for the engine to read after completion.
+		self.last_request_prompt: str = ""
+		self.last_response_raw: str = ""
+
+		# Per-actor conversation log: captures every LLM exchange with thinking.
+		# Each entry: {tick, call_type, prompt, thinking, response, duration}
+		self.conversation_log: list[dict] = []
+		self.CONVERSATION_LOG_MAX: int = 50
+
+		# Separate lightweight model for health checks (short timeout).
+		# Thinking is disabled so all tokens go to the content response.
+		self._health_check_model = OllamaClient(
+			model_id=model_name,
+			api_base=api_base,
+			timeout=30,
+			max_tokens=128,
+			num_ctx=8192,
+			think=False,
+		)
+
+	def _log_llm_call(self, call_type: str, prompt: str, thinking: str, response: str, duration: float) -> None:
+		"""Append an LLM exchange to the per-actor conversation log."""
+		self.conversation_log.append({
+			"tick": self.engine.tick_count if self.engine else 0,
+			"call_type": call_type,
+			"prompt": prompt,
+			"thinking": thinking,
+			"response": response,
+			"duration": round(duration, 2),
+		})
+		# Keep bounded.
+		if len(self.conversation_log) > self.CONVERSATION_LOG_MAX:
+			self.conversation_log = self.conversation_log[-self.CONVERSATION_LOG_MAX:]
+
+	def health_check(self) -> tuple[bool, str]:
+		"""Send a trivial prompt to verify the LLM is responding.
+
+		Returns (alive, detail) where alive is True if a response was received.
+		Uses a dedicated model instance with a short 30-second timeout.
+		"""
+		messages = [
+			ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": "Respond with exactly: OK"}]),
+		]
+		try:
+			response = self._health_check_model(messages)
+			content = response.content if hasattr(response, "content") else str(response)
+			thinking = response.thinking if hasattr(response, "thinking") else ""
+			self._log_llm_call("health_check", "Respond with exactly: OK", thinking, content.strip()[:200], response.duration if hasattr(response, "duration") else 0)
+			return True, content.strip()[:200]
+		except Exception as e:
+			self._log_llm_call("health_check", "Respond with exactly: OK", "", f"[ERROR] {e}", 0)
+			return False, str(e)[:200]
 
 	def _role_goal_directive(self) -> str:
 		"""Return the high-level role objective for strategic planning prompts."""
@@ -297,13 +358,11 @@ class AgentBrain:
 		return ", ".join(str(t).strip() for t in traits if str(t).strip())
 
 	def _is_low_quality_plan(self, plan: list[PlannedAction]) -> bool:
-		"""Treat all-wait or tiny mostly-idle plans as low quality."""
+		"""Treat empty or all-wait plans as low quality."""
 		if not plan:
 			return True
 		non_wait = [a for a in plan if a.action_type != "wait"]
 		if not non_wait:
-			return True
-		if len(plan) >= 4 and len(non_wait) == 1 and all(a.action_type == "wait" for a in plan[:3]):
 			return True
 		return False
 
@@ -375,6 +434,8 @@ class AgentBrain:
 		try:
 			response = self.model(messages)
 			raw = response.content if hasattr(response, "content") else str(response)
+			thinking = response.thinking if hasattr(response, "thinking") else ""
+			self._log_llm_call("fallback_policy", prompt, thinking, raw, response.duration if hasattr(response, "duration") else 0)
 			parsed = _extract_json_object(raw)
 			self._adaptive_fallback_policy = self._normalize_fallback_policy(parsed, refresh_reason)
 			self._adaptive_fallback_policy_tick = self.engine.tick_count
@@ -428,6 +489,8 @@ class AgentBrain:
 			try:
 				response = self.model(messages)
 				content = response.content if hasattr(response, "content") else str(response)
+				thinking = response.thinking if hasattr(response, "thinking") else ""
+				self._log_llm_call("fallback_plan", prompt, thinking, content, response.duration if hasattr(response, "duration") else 0)
 				plan, summary = parse_plan(content, self.actor.name)
 				if not self._is_low_quality_plan(plan):
 					return plan, f"{summary} (adaptive fallback)"
@@ -468,46 +531,24 @@ class AgentBrain:
 				"Reassess the situation and form a new plan."
 			)
 		role_goal = self._role_goal_directive()
-		traits_text = self._traits_text()
 
 		user_msg = (
 			f"Tick {self.engine.tick_count} | HP: {self.actor.hp}/{self.actor.max_hp} | "
-			f"ATK: {self.actor.base_attack} | DEF: {self.actor.base_defense} | "
-			f"CRIT: {self.actor.base_crit:.0%} | "
-			f"Gold: {self.actor.gold}g | Fame: {self.actor.fame} | Infamy: {self.actor.infamy} | Traits: {traits_text} | Carrying: {inv_summary}\n\n"
-			f"{role_goal}\n"
-			"Visible actor roles and item ownership labels in observation are authoritative ground truth.\n\n"
+			f"Gold: {self.actor.gold}g | Fame: {self.actor.fame} | Infamy: {self.actor.infamy} | Carrying: {inv_summary}\n\n"
+			f"{role_goal}\n\n"
 			f"WORLD OBSERVATION:\n{observation}"
 			f"{interrupt_ctx}\n\n"
-			f"Create a plan of {self.PLAN_HORIZON} steps (fill all {self.PLAN_HORIZON} — do not stop early). "
-			f"Chain multiple goals: move somewhere, do something, then move somewhere else. "
-			f"Use wait steps only when genuinely idle between goals.\n"
-			"MOVEMENT REMINDER: y increases southward. To move toward a higher y, go south. To move toward a lower y, go north. To move toward a higher x, go east. To move toward a lower x, go west.\n"
-			"TRADE REMINDER: if an actor is marked [TRADE RANGE], do NOT move — use propose_trade immediately.\n"
-			"CONVERSE REMINDER: if an actor is marked [CONVERSATION RANGE], you may use converse to talk with them — useful for building relationships, gathering information, or roleplay.\n"
-			"ATTACK REMINDER: if an actor is marked [ATTACK RANGE], you may attack them with attack. Only attack if it makes sense for your character.\n"
-			"CRIME REMINDER: stealing owned shelf items or initiating unprovoked violence can increase infamy and trigger guard punishment if witnessed.\n"
-			"EQUIP REMINDER: use equip to put an item from your inventory into its slot. The item's slot is defined in items.json (hand, chest, head, legs, offhand). Two-handed weapons go in hand and block offhand.\n"
-			"Return ONLY a valid JSON object with exactly two keys:\n"
-			'  "summary": a single sentence (15-25 words) written in third person describing '
-			"your character's thoughts and intended actions in their own voice and personality.\n"
-			'  "plan": a JSON array where each element is one of these shapes:\n'
-			'    {"action_type": "move", "params": {"direction": "north"}, "reason": ""}\n'
-			'    {"action_type": "wait", "params": {}, "reason": ""}\n'
-			'    {"action_type": "propose_trade", "params": {"target_actor_id": "<use the id field from observation>", '
-			'"offered_gold": 50, "offered_item_ids": "", "requested_item_ids": "<item id from their carrying/selling>", '
-			'"requested_gold": 0}, "reason": ""}\n'
-			'    {"action_type": "converse", "params": {"target_actor_id": "<use the id field from observation>", "opening_line": "What do you sell here?"}, "reason": ""}\n'
-			'    {"action_type": "pick_up", "params": {"item_id": "<id from items on ground list>"}, "reason": ""}\n'
-			'    {"action_type": "place", "params": {"item_id": "<id from your inventory>", "x": 5, "y": 3}, "reason": ""}\n'
-			'    {"action_type": "attack", "params": {"target_actor_id": "<id from observation>"}, "reason": ""}\n'
-			'    {"action_type": "equip", "params": {"item_id": "<id from your inventory>"}, "reason": ""}\n'
-			'    {"action_type": "unequip", "params": {"slot": "hand"}, "reason": ""}\n'
-			'    {"action_type": "use_item", "params": {"item_id": "<id of consumable in your inventory>"}, "reason": ""}\n'
-			"Valid directions: north, south, east, west, northeast, northwest, southeast, southwest.\n"
-			"TRADE NOTE: to buy a shopkeeper's shelf item, use propose_trade with the item id shown in their carrying/selling list.\n"
-			"PICK UP NOTE: use pick_up only for unowned floor items marked [PICK UP RANGE].\n"
-			"No prose outside the JSON. No markdown. Only the JSON object."
+			f"Create a plan of {self.PLAN_HORIZON} steps.\n"
+			"Return ONLY a JSON object: {\"summary\": \"<one sentence>\", \"plan\": [...]}\n"
+			"Each step is ONE of:\n"
+			"  {\"action_type\":\"move\",\"params\":{\"direction\":\"north|south|east|west|ne|nw|se|sw\"},\"reason\":\"\"}\n"
+			"  {\"action_type\":\"wait\",\"params\":{},\"reason\":\"\"}\n"
+			"  {\"action_type\":\"propose_trade\",\"params\":{\"target_actor_id\":\"\",\"offered_gold\":0,\"offered_item_ids\":\"\",\"requested_item_ids\":\"\",\"requested_gold\":0},\"reason\":\"\"}\n"
+			"  {\"action_type\":\"converse\",\"params\":{\"target_actor_id\":\"\",\"opening_line\":\"\"},\"reason\":\"\"}\n"
+			"  {\"action_type\":\"pick_up\",\"params\":{\"item_id\":\"\"},\"reason\":\"\"}\n"
+			"  {\"action_type\":\"attack\",\"params\":{\"target_actor_id\":\"\"},\"reason\":\"\"}\n"
+			"  {\"action_type\":\"equip\",\"params\":{\"item_id\":\"\"},\"reason\":\"\"}\n"
+			"No prose. No markdown. Only the JSON object."
 		)
 
 		messages = [
@@ -515,9 +556,15 @@ class AgentBrain:
 			ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": user_msg}]),
 		]
 
+		self.last_request_prompt = user_msg
+		self.last_response_raw = ""
+
 		try:
 			response = self.model(messages)
 			content: str = response.content if hasattr(response, "content") else str(response)
+			thinking: str = response.thinking if hasattr(response, "thinking") else ""
+			self.last_response_raw = content
+			self._log_llm_call("plan", user_msg, thinking, content, response.duration if hasattr(response, "duration") else 0)
 			plan, summary = parse_plan(content, self.actor.name)
 			if self._is_low_quality_plan(plan):
 				if not allow_adaptive_fallback:
@@ -531,6 +578,8 @@ class AgentBrain:
 				)
 			return plan, summary
 		except Exception as e:
+			self.last_response_raw = f"[ERROR] {e}"
+			self._log_llm_call("plan", user_msg, "", f"[ERROR] {e}", 0)
 			if not allow_adaptive_fallback:
 				return [PlannedAction(action_type="wait", params={}, reason=f"initial warm-up failed: {e}")], (
 					f"{self.actor.name} failed initial planning and will recover after startup."
@@ -588,7 +637,10 @@ class AgentBrain:
 		try:
 			response = self.model([ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": prompt}])])
 			raw: str = response.content if hasattr(response, "content") else str(response)
+			thinking: str = response.thinking if hasattr(response, "thinking") else ""
+			self._log_llm_call("trade_eval", prompt, thinking, raw, response.duration if hasattr(response, "duration") else 0)
 		except Exception as e:
+			self._log_llm_call("trade_eval", prompt, "", f"[ERROR] {e}", 0)
 			return False, f"{self.actor.name} couldn't process the offer right now."
 
 		return parse_trade_decision(raw, self.actor.name)
@@ -622,7 +674,10 @@ class AgentBrain:
 				ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": prompt}]),
 			])
 			raw: str = response.content if hasattr(response, "content") else str(response)
+			thinking: str = response.thinking if hasattr(response, "thinking") else ""
+			self._log_llm_call("conversation", prompt, thinking, raw, response.duration if hasattr(response, "duration") else 0)
 		except Exception:
+			self._log_llm_call("conversation", prompt, "", "[ERROR]", 0)
 			return f"{self.actor.name} says nothing.", [], "", "No impression formed."
 		return _parse_conversation_packet_response(raw, self.actor.name)
 
@@ -680,7 +735,10 @@ class AgentBrain:
 				ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": prompt}]),
 			])
 			raw = response.content if hasattr(response, "content") else str(response)
+			thinking = response.thinking if hasattr(response, "thinking") else ""
+			self._log_llm_call("social_impact", prompt, thinking, raw, response.duration if hasattr(response, "duration") else 0)
 		except Exception:
+			self._log_llm_call("social_impact", prompt, "", "[ERROR]", 0)
 			return {
 				"likeness_delta": 0,
 				"suspicion_deltas": {},
@@ -778,7 +836,7 @@ def create_agent_for_actor(
 	actor: Actor,
 	world_map: Map,
 	engine: SimulationEngine,
-	model_name: str = "ollama/llama3.2",
+	model_name: str = "qwen3:4b",
 	api_base: str = "http://localhost:11434",
 ) -> AgentBrain:
 	"""Factory function to create an agent brain for an actor.
@@ -787,8 +845,8 @@ def create_agent_for_actor(
 	    actor: The Actor to create a brain for.
 	    world_map: The world Map.
 	    engine: The SimulationEngine instance.
-	    model_name: LLM model identifier (default: local Ollama llama3.2).
-	    api_base: API base URL (default: local Ollama server).
+	    model_name: Ollama model name (default: qwen3:4b).
+	    api_base: Ollama server URL (default: http://localhost:11434).
 	    
 	Returns:
 	    An AgentBrain instance.

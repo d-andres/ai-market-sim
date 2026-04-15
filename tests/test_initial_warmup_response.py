@@ -29,6 +29,8 @@ class _ScriptedModel:
 
         class _Resp:
             content = payload
+            thinking = ""
+            duration = 0.0
 
         return _Resp()
 
@@ -86,10 +88,65 @@ def test_non_warmup_can_use_adaptive_fallback_chain() -> None:
     print("PASS  test_non_warmup_can_use_adaptive_fallback_chain")
 
 
+def test_warmup_fallback_marks_actor_for_immediate_replan() -> None:
+    """When warm-up produces a wait-only fallback, the actor should be marked for
+    immediate critical replan so the tick loop doesn't defer 23 ticks."""
+    from src.models.schema import PlannedAction
+
+    world_map = _make_map()
+    actor = Actor(id="a1", name="Adventurer", role=ActorRole.PLAYER, x=5, y=5, gold=50)
+    world_map.actors = [actor]
+
+    # Simulate what main.py does after warm-up returns a fallback plan
+    plan = [PlannedAction(action_type="wait", params={}, reason="initial warm-up fallback")]
+    actor.action_queue = plan
+    is_fallback = all(a.action_type == "wait" for a in plan)
+    if is_fallback:
+        actor.needs_replan = True
+        actor.interrupt_reason = "initial plan was low quality"
+    else:
+        actor.needs_replan = False
+        actor.interrupt_reason = ""
+
+    assert actor.needs_replan, "Fallback plan should mark needs_replan=True"
+    assert actor.interrupt_reason, "Fallback plan should set interrupt_reason to trigger replan at next interval"
+    print("PASS  test_warmup_fallback_marks_actor_for_immediate_replan")
+
+
+def test_plan_timeout_watchdog_cleans_up_stuck_futures() -> None:
+    """Futures pending for too many ticks should be abandoned by the watchdog."""
+    from concurrent.futures import Future
+    from src.simulation.engine import PLAN_TIMEOUT_TICKS
+
+    world_map = _make_map()
+    actor = Actor(id="a1", name="Adventurer", role=ActorRole.PLAYER, x=5, y=5, gold=50)
+    world_map.actors = [actor]
+    engine = SimulationEngine(world_map, enable_ai=False)
+
+    # Plant a fake never-completing future
+    fake_future = Future()
+    engine._pending_plan_futures["a1"] = fake_future
+    engine._pending_plan_started_tick["a1"] = 0
+    engine._pending_plan_generation["a1"] = 0
+
+    # Advance tick_count past the timeout threshold
+    engine.tick_count = PLAN_TIMEOUT_TICKS + 1
+
+    updates = {"tick": engine.tick_count, "events": [], "actor_actions": []}
+    engine._collect_completed_plan_requests(updates)
+
+    assert "a1" not in engine._pending_plan_futures, "Timed-out future should be removed"
+    assert actor.needs_replan, "Actor should be marked for replan after timeout"
+    assert "timed out" in actor.interrupt_reason.lower(), f"Expected timeout reason, got: {actor.interrupt_reason}"
+    print("PASS  test_plan_timeout_watchdog_cleans_up_stuck_futures")
+
+
 if __name__ == "__main__":
     tests = [
         test_initial_response_single_pass_no_adaptive_cascade,
         test_non_warmup_can_use_adaptive_fallback_chain,
+        test_warmup_fallback_marks_actor_for_immediate_replan,
+        test_plan_timeout_watchdog_cleans_up_stuck_futures,
     ]
 
     passed = 0

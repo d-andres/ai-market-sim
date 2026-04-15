@@ -30,6 +30,8 @@ class _ScriptedModel:
 
         class _Resp:
             content = payload
+            thinking = ""
+            duration = 0.0
 
         return _Resp()
 

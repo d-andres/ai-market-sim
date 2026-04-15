@@ -50,25 +50,24 @@ if TYPE_CHECKING:
 
 # Minimum ticks after a plan completes before an actor re-queues for exploration.
 # Only critical-interrupt replans (interrupt_reason set) bypass this.
-# At the default 2s/tick this equals 46 seconds.
-REPLAN_CADENCE_TICKS: int = 23
+# At the default 2s/tick this equals ~16 seconds.
+REPLAN_CADENCE_TICKS: int = 8
 
-# Minimum ticks to wait before retrying after a planning failure (≈ 30 seconds).
-PLAN_FAILURE_COOLDOWN_TICKS: int = 15
+# Minimum ticks to wait before retrying after a planning failure (≈ 20 seconds).
+PLAN_FAILURE_COOLDOWN_TICKS: int = 10
 
 # Hard cap on simultaneous in-flight LLM planning requests.
 MAX_CONCURRENT_PLAN_JOBS: int = 10
 
 # Maximum ticks a plan future can be pending before we abandon it.
-# At 2s/tick this equals ~300 seconds (5 minutes).
-# create_plan can cascade into up to 3 sequential LLM calls (primary + policy + fallback),
-# each with a 180s litellm timeout, so this must be generous.
-PLAN_TIMEOUT_TICKS: int = 150
+# At 2s/tick this equals ~600 seconds (10 minutes).
+# A single create_plan call goes to Ollama with a 300s HTTP timeout.
+PLAN_TIMEOUT_TICKS: int = 300
 
 # After a timeout, cooldown ticks before replanning (applied when health check passes).
 # If health check fails, this is doubled.
-TIMEOUT_REPLAN_COOLDOWN_TICKS: int = 10
-TIMEOUT_UNHEALTHY_COOLDOWN_TICKS: int = 45
+TIMEOUT_REPLAN_COOLDOWN_TICKS: int = 5
+TIMEOUT_UNHEALTHY_COOLDOWN_TICKS: int = 20
 
 # Social/crime mechanics
 WITNESS_VISION_RANGE: int = 10
@@ -109,7 +108,7 @@ class SimulationEngine:
 		world_map: Map,
 		tick_rate: float = 1.0,
 		enable_ai: bool = True,
-		ollama_model: str = "ollama/llama3.2",
+		ollama_model: str = "qwen3:4b",
 		ollama_base_url: str = "http://localhost:11434",
 	):
 		"""Initialize the simulation engine.
@@ -118,8 +117,8 @@ class SimulationEngine:
 		    world_map: The Map object representing the world.
 		    tick_rate: Seconds per tick (default 1.0 = 1 tick per second).
 		    enable_ai: Whether to enable AI agents (default True).
-		    ollama_model: LLM model identifier (format depends on provider).
-		    ollama_base_url: API base URL (for providers that need it, like Ollama).
+		    ollama_model: Ollama model name (e.g. 'qwen3:4b').
+		    ollama_base_url: Ollama API base URL.
 		"""
 		self.world_map = world_map
 		self.tick_rate = tick_rate
@@ -127,6 +126,7 @@ class SimulationEngine:
 		self.start_time = datetime.now()
 		self.events: list[SimulationEvent] = []
 		self.enable_ai = enable_ai
+		self.replan_interval: int = 10  # ticks between AI plan revisions (user-configurable)
 		self.llm_call_count: int = 0  # total LLM planning calls made
 		self.llm_response_count: int = 0  # successful LLM responses received
 		self.llm_timeout_count: int = 0  # LLM requests that timed out
@@ -794,10 +794,11 @@ class SimulationEngine:
 			# Process LLM health checks (submitted after timeouts).
 			self._collect_health_check_results()
 
-			# Submit new plan requests in priority order, respecting cadence/cooldown/cap.
-			# Priority 0 = critical interrupt (needs_replan + interrupt_reason) → always immediate
-			# Priority 1 = voluntary replan or soft replan  → subject to REPLAN_CADENCE_TICKS
-			# Priority 2 = queue exhausted                  → subject to REPLAN_CADENCE_TICKS
+			# Submit new plan requests in priority order, respecting replan interval.
+			# ALL plan submissions (including interrupts) wait for the next replan interval
+			# boundary (tick_count % replan_interval == 0). interrupt_reason still controls
+			# sort priority so urgent cases are processed first when the tick arrives.
+			is_replan_tick = (self.tick_count % self.replan_interval == 0)
 			candidates = [
 				a for a in self.world_map.actors
 				if (a.needs_replan or not a.action_queue)
@@ -814,12 +815,9 @@ class SimulationEngine:
 			for actor in candidates:
 				if len(self._pending_plan_futures) >= MAX_CONCURRENT_PLAN_JOBS:
 					break
-				# Critical interrupts (interrupt_reason set) bypass cadence; everything else waits.
-				is_critical = actor.needs_replan and bool(actor.interrupt_reason)
-				if not is_critical:
-					last = self._plan_last_completed_tick.get(actor.id, 0)
-					if self.tick_count - last < REPLAN_CADENCE_TICKS:
-						continue
+				# No plan submissions outside the replan interval tick — user controls pacing.
+				if not is_replan_tick:
+					continue
 				self._submit_plan_request(actor, self.agent_brains[actor.id])
 
 			# Keep UI status in sync with currently pending planning jobs.
@@ -1604,6 +1602,15 @@ class SimulationEngine:
 			}
 			for e in self.events[-limit:]
 		]
+
+	def get_actor_conversation_logs(self) -> dict[str, list[dict]]:
+		"""Return per-actor LLM conversation logs keyed by actor name."""
+		logs: dict[str, list[dict]] = {}
+		for actor_id, brain in self.agent_brains.items():
+			actor = self._actor_by_id(actor_id)
+			name = actor.name if actor else actor_id
+			logs[name] = list(brain.conversation_log)
+		return logs
 
 	def evaluate_trade_proposal(
 		self,
