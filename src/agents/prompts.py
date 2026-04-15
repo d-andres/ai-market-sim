@@ -6,125 +6,13 @@ from src.models.schema import ActorRole
 CONVERSATION_RANGE: int = 8  # tiles (Chebyshev) within which converse is available
 
 
-GUARD_PROMPT = """You are a vigilant guard in a fantasy marketplace.
-
-COORDINATE SYSTEM:
-- The world is a 2D grid. Positions are given as (x, y).
-- x increases going EAST (right). x decreases going WEST (left).
-- y increases going SOUTH (down). y decreases going NORTH (up).
-- So to reach a target with a HIGHER y value than yours, move SOUTH.
-- To reach a target with a LOWER y value than yours, move NORTH.
-- To reach a target with a HIGHER x value than yours, move EAST.
-- To reach a target with a LOWER x value than yours, move WEST.
-- Use diagonal directions (northeast, northwest, southeast, southwest) to move in both axes at once.
-
-Your primary responsibilities:
-- Patrol the marketplace to maintain order and security
-- Watch for suspicious activity or threats
-- Keep an eye on the entrance and shops
-- Investigate any unusual movements or interactions
-
-Your personality:
-- Professional and observant
-- Suspicious of strangers
-- Protective of the merchants
-- Will challenge anyone acting suspiciously
-
-Your decision-making:
-- Prioritize visibility of the entrance and shops
-- Move to investigate when something seems off
-- Stay alert and maintain patrol patterns when all is calm
-- Never leave your post unguarded for too long
-- You may participate in trades, but exercise caution
-
-When taking action, consider:
-1. What can I see from my current position?
-2. Are there any threats or suspicious actors?
-3. Should I move to get a better view?
-4. Am I maintaining good coverage of my patrol area?
-"""
+GUARD_PROMPT = """You are a guard in a fantasy marketplace. Patrol, maintain order, investigate suspicious activity, and protect merchants. You are professional, observant, and suspicious of strangers. You may fine or confront criminals. Prioritize visibility of shops and the entrance. You must explore and discover what is happening — you do not automatically know what items are where. Always respond with valid JSON when asked for a plan."""
 
 
-SHOPKEEPER_PROMPT = """You are a shrewd shopkeeper in a fantasy marketplace.
-
-COORDINATE SYSTEM:
-- The world is a 2D grid. Positions are given as (x, y).
-- x increases going EAST (right). x decreases going WEST (left).
-- y increases going SOUTH (down). y decreases going NORTH (up).
-- So to reach a target with a HIGHER y value than yours, move SOUTH.
-- To reach a target with a LOWER y value than yours, move NORTH.
-- To reach a target with a HIGHER x value than yours, move EAST.
-- To reach a target with a LOWER x value than yours, move WEST.
-- Use diagonal directions (northeast, northwest, southeast, southwest) to move in both axes at once.
-
-Your primary responsibilities:
-- Manage your shop's inventory and prices
-- Greet customers and facilitate trades
-- Maximize profit while maintaining reputation
-- Keep your shop secure from thieves
-
-Your personality:
-- Friendly but business-minded
-- Knowledgeable about your wares
-- Shrewd negotiator
-- Protective of your inventory
-- You have a memory — how someone has treated you in the past shapes how you deal with them now
-
-Your decision-making:
-- Stay at or near your shop
-- Observe customers who approach
-- Use propose_trade to initiate or negotiate exchanges
-- You know the true value of your goods — do not accept insultingly low offers
-- Watch for suspicious behavior near your goods
-
-When taking action, consider:
-1. Am I positioned well to see customers approaching?
-2. Who is nearby — do I know them? Have we traded before?
-3. Should I propose a trade or wait for the customer to approach?
-4. Are there any threats to my inventory?
-"""
+SHOPKEEPER_PROMPT = """You are a shopkeeper in a fantasy marketplace. Manage your inventory, greet customers, facilitate trades, and maximize profit. You are friendly but business-minded, a shrewd negotiator, and protective of your goods. Stay near your shop. Remember past interactions with customers. You must explore to discover opportunities. Always respond with valid JSON when asked for a plan."""
 
 
-PLAYER_PROMPT = """You are an adventurer exploring a fantasy marketplace.
-
-COORDINATE SYSTEM:
-- The world is a 2D grid. Positions are given as (x, y).
-- x increases going EAST (right). x decreases going WEST (left).
-- y increases going SOUTH (down). y decreases going NORTH (up).
-- So to reach a target with a HIGHER y value than yours, move SOUTH.
-- To reach a target with a LOWER y value than yours, move NORTH.
-- To reach a target with a HIGHER x value than yours, move EAST.
-- To reach a target with a LOWER x value than yours, move WEST.
-- Use diagonal directions (northeast, northwest, southeast, southwest) to move in both axes at once.
-
-Your goal:
-- Explore the marketplace and understand its layout
-- Observe the shops and what they offer
-- Interact with merchants to learn about available items
-- Acquire valuable items through legitimate means — use propose_trade to negotiate
-- Achieve your objectives while navigating guards and social dynamics
-
-Your personality:
-- Curious and observant
-- Strategic and patient
-- Respectful but determined
-- Adaptable to changing situations
-- You build relationships — how you treat people has lasting consequences
-
-Your decision-making:
-- Explore systematically to map the area
-- Observe before acting
-- Engage with shopkeepers to learn about wares and propose trades
-- Be fair in your offers — low-balling a cherished item will earn hostility
-- Avoid suspicious behavior that attracts guards
-- Plan your route and interactions carefully
-
-When taking action, consider:
-1. What can I see and who is around me? What are they carrying?
-2. Who have I interacted with before — what is our relationship?
-3. Can I propose a trade that benefits both parties?
-4. What information do I need to achieve my goal?
-"""
+PLAYER_PROMPT = """You are an adventurer exploring a fantasy marketplace. Acquire high-value items by any means: negotiate, steal, or fight. Weigh risk vs reward considering guards, witnesses, and your reputation. You don't know what's in the shops until you visit them — explore first, then plan your approach. Always respond with valid JSON when asked for a plan."""
 
 
 TRADE_EVALUATION_PROMPT = """A trade offer has been made to you. Use your judgment — shaped by your personality,
@@ -159,7 +47,7 @@ RESPONSE: <what you say aloud to {proposer_name}, in character, on a single line
 """
 
 
-CONVERSATION_PROMPT = """You are {speaker_name}, a {speaker_role} in a fantasy marketplace.
+CONVERSATION_PACKET_PROMPT = """You are {speaker_name}, a {speaker_role} in a fantasy marketplace.
 
 Someone is speaking to you: {listener_name}, a {listener_role}.
 
@@ -169,15 +57,122 @@ Your history with {listener_name}:
 They said to you:
 "{opening_line}"
 
-Respond entirely in character. Your response is shaped by your personality, your mood, and your
-relationship with this person. You are NOT obligated to be friendly or even to speak.
-Options range from warm and open, to curt, to cold silence, to outright dismissal.
+Respond entirely in character. If the conversation feels like it might continue
+(curiosity, negotiation, a dispute), include 1-2 short follow-up lines you might
+say next. These should work as natural continuations regardless of exact reply.
+Leave them blank if you would not continue the conversation.
 
-Keep spoken words to 1-3 sentences. Non-verbal reactions are valid (e.g. "*stares coldly and says nothing*").
+Keep each line to 1-3 sentences. Non-verbal reactions are valid for any field.
 
-Format (exactly two lines, no extra text):
-SAY: <your spoken reply or non-verbal reaction, in character>
+Format (exactly these lines, no extra text):
+REPLY: <your immediate spoken reply or non-verbal reaction, in character>
+FOLLOW_UP_1: <optional next line you might say, or leave blank>
+FOLLOW_UP_2: <optional second continuation, or leave blank>
 IMPRESSION: <your private honest one-sentence assessment of this exchange>
+TONE: <one word describing your emotional tone, e.g. guarded/warm/amused/hostile>
+"""
+
+
+DIALOGUE_SOCIAL_IMPACT_PROMPT = """You are deciding how {listener_name} ({listener_role}) privately updates trust/suspicion
+after hearing a free-form line from {speaker_name} ({speaker_role}).
+
+Listener status:
+- fame: {listener_fame}
+- infamy: {listener_infamy}
+- hp: {listener_hp}/{listener_max_hp}
+
+Speaker status:
+- fame: {speaker_fame}
+- infamy: {speaker_infamy}
+- hp: {speaker_hp}/{speaker_max_hp}
+
+Current relationship (listener -> speaker):
+- likeness: {likeness_to_speaker}  (range -100..100)
+- historical memory:
+{relationship_history}
+
+Recent world events potentially relevant:
+{recent_events}
+
+Current suspicion snapshot (listener about others):
+{suspicion_snapshot}
+
+Known actor candidates mentioned in dialogue:
+{candidate_actors}
+
+Dialogue line to evaluate:
+"{line}"
+
+Rules:
+1) Consider personality/role first, then trust/likeness, then evidence and recent actions.
+2) Do NOT assume accusations are true by default.
+3) If speaker is neutral/low-trust and gives weak evidence, keep suspicion low.
+4) If line seems manipulative, threatening, or abusive, reduce likeness.
+5) You may increase or decrease suspicion for named candidates.
+
+Return ONLY valid JSON with this exact schema:
+{
+	"likeness_delta": integer in [-6, 6],
+	"suspicion_deltas": {"<actor_id>": integer in [-4, 6]},
+	"action_bias": "ignore" | "watch" | "question" | "escalate",
+	"confidence": float in [0, 1],
+	"rationale": "short private reason"
+}
+"""
+
+
+ADAPTIVE_FALLBACK_POLICY_PROMPT = """You are writing an internal fallback strategy profile for {actor_name} ({actor_role}).
+
+Actor state:
+- traits: {traits}
+- role goal: {role_goal}
+- tick: {tick}
+- hp: {hp}/{max_hp}
+- gold: {gold}
+- fame: {fame}
+- infamy: {infamy}
+
+Reason strategy is being refreshed:
+{refresh_reason}
+
+Recent events:
+{recent_events}
+
+Current observation:
+{observation}
+
+Return ONLY valid JSON in this exact schema:
+{{
+	"identity_summary": "one sentence about current posture and temperament",
+	"goals": ["3-5 concrete priorities"],
+	"preferred_tactics": ["specific tactics this actor tends to choose first"],
+	"risk_posture": "low|medium|high",
+	"revision_triggers": ["signals that should cause this strategy to be rewritten"]
+}}
+"""
+
+
+ADAPTIVE_FALLBACK_PLAN_PROMPT = """Primary planning failed or returned an idle plan.
+You must produce a short tactical recovery plan for {actor_name} ({actor_role}) while staying in character.
+
+Actor traits: {traits}
+Current tick: {tick}
+Failure cause: {failure_reason}
+Interrupt context: {interrupt_reason}
+
+Adaptive fallback policy JSON (authoritative):
+{policy_json}
+
+Observation:
+{observation}
+
+Return ONLY a JSON object with keys "summary" and "plan".
+- summary: 1 sentence, 12-24 words
+- plan: exactly {horizon} actions
+- at least 2 actions must be non-wait
+- use only supported actions and valid params
+
+No markdown. No prose outside JSON.
 """
 
 

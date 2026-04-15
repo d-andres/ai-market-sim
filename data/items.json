@@ -6,7 +6,9 @@
       "description": "A short, double-edged blade favored by scouts and thieves. Light enough to conceal, sharp enough to matter.",
       "base_price": 8,
       "quantity": 1,
-      "metadata": { "category": "weapon", "type": "blade", "slot": "hand" }
+      "metadata": { "category": "weapon", "type": "blade", "slot": "hand" },
+      "attack_bonus": 5,
+      "crit_bonus": 0.12
     },
     {
       "id": "short_sword",
@@ -14,7 +16,9 @@
       "description": "A reliable one-handed sword with a straight blade. A common sidearm for soldiers and adventurers alike.",
       "base_price": 25,
       "quantity": 1,
-      "metadata": { "category": "weapon", "type": "blade", "slot": "hand" }
+      "metadata": { "category": "weapon", "type": "blade", "slot": "hand" },
+      "attack_bonus": 8,
+      "crit_bonus": 0.05
     },
     {
       "id": "long_sword",
@@ -22,7 +26,9 @@
       "description": "A versatile two-handed blade with impressive reach. Requires strength and training to wield effectively.",
       "base_price": 60,
       "quantity": 1,
-      "metadata": { "category": "weapon", "type": "blade", "slot": "two_hand" }
+      "metadata": { "category": "weapon", "type": "blade", "slot": "two_hand" },
+      "attack_bonus": 14,
+      "crit_bonus": 0.02
     },
     {
       "id": "shield",
@@ -30,7 +36,8 @@
       "description": "A sturdy kite shield reinforced with iron banding. Offers solid protection against most physical attacks.",
       "base_price": 40,
       "quantity": 1,
-      "metadata": { "category": "armor", "type": "shield", "slot": "offhand" }
+      "metadata": { "category": "armor", "type": "shield", "slot": "offhand" },
+      "defense_bonus": 6
     },
     {
       "id": "buckler",
@@ -38,7 +45,8 @@
       "description": "A small, lightweight round shield strapped to the forearm. Less protective than a full shield but allows freer movement.",
       "base_price": 18,
       "quantity": 1,
-      "metadata": { "category": "armor", "type": "shield", "slot": "offhand" }
+      "metadata": { "category": "armor", "type": "shield", "slot": "offhand" },
+      "defense_bonus": 3
     },
     {
       "id": "red_potion",
@@ -46,7 +54,8 @@
       "description": "A bubbling crimson liquid sealed in a small glass vial. Rumored to restore vitality to those who drink it.",
       "base_price": 15,
       "quantity": 1,
-      "metadata": { "category": "consumable", "type": "potion", "color": "red" }
+      "metadata": { "category": "consumable", "type": "potion" },
+      "hp_delta": 30
     },
     {
       "id": "yellow_potion",
@@ -54,7 +63,9 @@
       "description": "A bright golden brew that glows faintly in the dark. Merchants are tight-lipped about exactly what it does.",
       "base_price": 20,
       "quantity": 1,
-      "metadata": { "category": "consumable", "type": "potion", "color": "yellow" }
+      "metadata": { "category": "consumable", "type": "potion" },
+      "hp_delta": 20,
+      "defense_delta": 1
     },
     {
       "id": "blue_potion",
@@ -62,7 +73,9 @@
       "description": "A cool, shimmering azure liquid that smells faintly of the sea. Said to sharpen the mind of its drinker.",
       "base_price": 20,
       "quantity": 1,
-      "metadata": { "category": "consumable", "type": "potion", "color": "blue" }
+      "metadata": { "category": "consumable", "type": "potion" },
+      "crit_delta": 0.05,
+      "attack_delta": 2
     },
     {
       "id": "green_potion",
@@ -70,7 +83,8 @@
       "description": "A thick, murky green concoction with a pungent herbal odor. Its effects are unpredictable — use with caution.",
       "base_price": 12,
       "quantity": 1,
-      "metadata": { "category": "consumable", "type": "potion", "color": "green" }
+      "metadata": { "category": "consumable", "type": "potion" },
+      "hp_delta": -25
     },
     {
       "id": "iron_helmet",
@@ -78,7 +92,8 @@
       "description": "A simple iron cap that protects the skull and temples. Functional but unadorned — soldiers ware, not nobles.",
       "base_price": 30,
       "quantity": 1,
-      "metadata": { "category": "armor", "type": "heavy", "slot": "head" }
+      "metadata": { "category": "armor", "type": "heavy", "slot": "head" },
+      "defense_bonus": 3
     },
     {
       "id": "iron_chest",
@@ -86,7 +101,8 @@
       "description": "A solid iron breastplate hammered to fit a broad frame. Heavy and slow but capable of deflecting a direct blow.",
       "base_price": 80,
       "quantity": 1,
-      "metadata": { "category": "armor", "type": "heavy", "slot": "chest" }
+      "metadata": { "category": "armor", "type": "heavy", "slot": "chest" },
+      "defense_bonus": 8
     },
     {
       "id": "iron_plates",
@@ -94,7 +110,8 @@
       "description": "Articulated iron plates that protect the thighs and shins. Pairs with the chestplate for full iron coverage.",
       "base_price": 55,
       "quantity": 1,
-      "metadata": { "category": "armor", "type": "heavy", "slot": "legs" }
+      "metadata": { "category": "armor", "type": "heavy", "slot": "legs" },
+      "defense_bonus": 5
     },
     {
       "id": "leather_hood",
@@ -102,7 +119,8 @@
       "description": "A supple hood of cured leather that covers the head and neck. Light enough to wear for hours without fatigue.",
       "base_price": 12,
       "quantity": 1,
-      "metadata": { "category": "armor", "type": "light", "slot": "head" }
+      "metadata": { "category": "armor", "type": "light", "slot": "head" },
+      "defense_bonus": 1
     },
     {
       "id": "leather_vest",
@@ -110,7 +128,8 @@
       "description": "A fitted vest of hardened leather, padded at the shoulders. The preferred torso armor for scouts and merchants.",
       "base_price": 22,
       "quantity": 1,
-      "metadata": { "category": "armor", "type": "light", "slot": "chest" }
+      "metadata": { "category": "armor", "type": "light", "slot": "chest" },
+      "defense_bonus": 3
     },
     {
       "id": "leather_leggings",
@@ -118,23 +137,8 @@
       "description": "Flexible leather trousers reinforced with extra stitching at the knees. Comfortable and quietly protective.",
       "base_price": 18,
       "quantity": 1,
-      "metadata": { "category": "armor", "type": "light", "slot": "legs" }
-    },
-    {
-      "id": "bow",
-      "name": "Bow",
-      "description": "A recurve bow carved from yew wood. Accurate at range and deadly in practiced hands. Requires arrows.",
-      "base_price": 45,
-      "quantity": 1,
-      "metadata": { "category": "weapon", "type": "ranged", "slot": "two_hand" }
-    },
-    {
-      "id": "arrows",
-      "name": "Arrows",
-      "description": "A bundle of twenty fletched arrows with iron tips. Standard ammunition sold by every reputable fletcher.",
-      "base_price": 10,
-      "quantity": 20,
-      "metadata": { "category": "weapon", "type": "ammunition", "slot": "quiver" }
+      "metadata": { "category": "armor", "type": "light", "slot": "legs" },
+      "defense_bonus": 2
     },
     {
       "id": "meat",
@@ -142,7 +146,8 @@
       "description": "A thick cut of roasted game meat wrapped in cloth. Still warm from the cookfire and filling on a cold night.",
       "base_price": 4,
       "quantity": 1,
-      "metadata": { "category": "consumable", "type": "food" }
+      "metadata": { "category": "consumable", "type": "food" },
+      "hp_delta": 15
     },
     {
       "id": "cheese",
@@ -150,7 +155,8 @@
       "description": "A dense wedge of aged hard cheese with a sharp, nutty flavor. Keeps well on long journeys.",
       "base_price": 3,
       "quantity": 1,
-      "metadata": { "category": "consumable", "type": "food" }
+      "metadata": { "category": "consumable", "type": "food" },
+      "hp_delta": 8
     },
     {
       "id": "water_bottle",
@@ -158,7 +164,8 @@
       "description": "A sealed clay bottle filled with clean spring water. Plain but essential for any traveler.",
       "base_price": 2,
       "quantity": 1,
-      "metadata": { "category": "consumable", "type": "drink" }
+      "metadata": { "category": "consumable", "type": "drink" },
+      "hp_delta": 5
     },
     {
       "id": "wine_bottle",
@@ -166,7 +173,9 @@
       "description": "A dark glass bottle of rough tavern wine, corked and sealed with wax. Not refined, but it does the job.",
       "base_price": 7,
       "quantity": 1,
-      "metadata": { "category": "consumable", "type": "drink" }
+      "metadata": { "category": "consumable", "type": "drink" },
+      "hp_delta": 10,
+      "attack_delta": 1
     },
     {
       "id": "lost_crown",

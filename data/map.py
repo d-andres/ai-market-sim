@@ -120,7 +120,18 @@ def render_ascii(grid: Map, show_actors: bool = True) -> str:
 	"""
 	# Build base map from tiles.
 	char_grid = [[grid.tile_at(x, y).symbol for x in range(grid.width)] for y in range(grid.height)]
-	
+
+	# Overlay world items: stocked shelf → 's', item on floor → 'i'.
+	item_positions = {(gi.x, gi.y) for gi in grid.world_items}
+	for iy in range(grid.height):
+		for ix in range(grid.width):
+			if (ix, iy) in item_positions:
+				curr = char_grid[iy][ix]
+				if curr == "S":
+					char_grid[iy][ix] = "s"
+				elif curr == ".":
+					char_grid[iy][ix] = "i"
+
 	# Overlay actors if requested.
 	if show_actors:
 		from src.models.schema import ActorRole
@@ -139,56 +150,12 @@ def render_ascii(grid: Map, show_actors: bool = True) -> str:
 	return "\n".join("".join(row) for row in char_grid)
 
 
-DEFAULT_MAP: Map = load_or_build_default_map()
-
-# Add test actors for physics demonstration.
-from src.models.schema import Actor, ActorRole
-
-if not DEFAULT_MAP.actors:  # Only add if no actors exist.
-	DEFAULT_MAP.actors = [
-		Actor(
-			id="guard_1",
-			name="Guard Thorne",
-			role=ActorRole.GUARD,
-			x=5,
-			y=5,
-			gold=50,
-			hp=100,
-		),
-		Actor(
-			id="shopkeeper_1",
-			name="Merchant Elara",
-			role=ActorRole.SHOPKEEPER,
-			x=10,
-			y=3,
-			gold=200,
-			hp=80,
-		),
-		Actor(
-			id="player",
-			name="Adventurer",
-			role=ActorRole.PLAYER,
-			x=10,
-			y=10,
-			gold=0,
-			hp=100,
-		),
-	]
-
-# Backward-compatibility names used by current src/main.py.
-build_default_market = build_default_map
-DEFAULT_MARKET = DEFAULT_MAP
-
-
 __all__ = [
 	"DEFAULT_MAP_PATH",
 	"build_default_map",
-	"build_default_market",
 	"load_map_from_json",
 	"load_or_build_default_map",
 	"get_wall_coordinates",
 	"get_shop_locations",
 	"render_ascii",
-	"DEFAULT_MAP",
-	"DEFAULT_MARKET",
 ]

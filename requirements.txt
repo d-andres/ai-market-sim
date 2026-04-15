@@ -13,6 +13,6 @@ uvicorn[standard]>=0.29
 # NiceGUI provides the web interface for real-time visualization.
 nicegui>=1.4
 
-# ── Agentic framework (LLM decision-making) ───────────────────────────────────
-# [litellm] extra bundles LiteLLM, which handles all provider routing (Ollama, OpenAI, etc.)
-smolagents[litellm]>=1.0
+# ── LLM inference (Ollama) ─────────────────────────────────────────────────────
+# Direct HTTP calls to Ollama via requests (no framework dependency needed).
+requests>=2.31

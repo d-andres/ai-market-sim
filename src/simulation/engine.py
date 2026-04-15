@@ -11,16 +11,81 @@ Phase 3: AI agents control all actor behavior via LLM reasoning.
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
+import re
 from typing import TYPE_CHECKING
 
-from src.models.schema import Actor, Map, PlannedAction, TradeProposal
+from src.models.schema import (
+	Actor,
+	ActorRole,
+	AttackParams,
+	ConverseParams,
+	ConversationPacket,
+	EquipParams,
+	UnequipParams,
+	UseItemParams,
+	WorldItem,
+	Item,
+	Map,
+	MoveParams,
+	PickUpParams,
+	PlaceParams,
+	PlannedAction,
+	ProposeTradeParams,
+	TradeProposal,
+)
 from src.simulation import physics
 
 if TYPE_CHECKING:
 	from src.agents.brain import AgentBrain
+
+
+# ---------------------------------------------------------------------------
+# Planning cadence and load-shedding
+# ---------------------------------------------------------------------------
+
+# Minimum ticks after a plan completes before an actor re-queues for exploration.
+# Only critical-interrupt replans (interrupt_reason set) bypass this.
+# At the default 2s/tick this equals ~16 seconds.
+REPLAN_CADENCE_TICKS: int = 8
+
+# Minimum ticks to wait before retrying after a planning failure (≈ 20 seconds).
+PLAN_FAILURE_COOLDOWN_TICKS: int = 10
+
+# Hard cap on simultaneous in-flight LLM planning requests.
+MAX_CONCURRENT_PLAN_JOBS: int = 10
+
+# Maximum ticks a plan future can be pending before we abandon it.
+# At 2s/tick this equals ~600 seconds (10 minutes).
+# A single create_plan call goes to Ollama with a 300s HTTP timeout.
+PLAN_TIMEOUT_TICKS: int = 300
+
+# After a timeout, cooldown ticks before replanning (applied when health check passes).
+# If health check fails, this is doubled.
+TIMEOUT_REPLAN_COOLDOWN_TICKS: int = 5
+TIMEOUT_UNHEALTHY_COOLDOWN_TICKS: int = 20
+
+# Social/crime mechanics
+WITNESS_VISION_RANGE: int = 10
+SELF_DEFENSE_WINDOW_TICKS: int = 12
+
+# Dialogue-driven social inference
+POSITIVE_DIALOGUE_WORDS = (
+	"thanks", "thank", "please", "sorry", "friend", "help", "appreciate", "grateful"
+)
+NEGATIVE_DIALOGUE_WORDS = (
+	"idiot", "stupid", "hate", "liar", "scum", "trash", "fool"
+)
+THREAT_DIALOGUE_WORDS = (
+	"kill", "hurt", "attack", "destroy", "die"
+)
+ACCUSATION_DIALOGUE_WORDS = (
+	"stole", "steal", "thief", "murder", "murdered", "crime", "criminal", "attacked", "assault"
+)
 
 
 @dataclass
@@ -43,7 +108,7 @@ class SimulationEngine:
 		world_map: Map,
 		tick_rate: float = 1.0,
 		enable_ai: bool = True,
-		ollama_model: str = "ollama/llama3.2",
+		ollama_model: str = "qwen3:4b",
 		ollama_base_url: str = "http://localhost:11434",
 	):
 		"""Initialize the simulation engine.
@@ -52,8 +117,8 @@ class SimulationEngine:
 		    world_map: The Map object representing the world.
 		    tick_rate: Seconds per tick (default 1.0 = 1 tick per second).
 		    enable_ai: Whether to enable AI agents (default True).
-		    ollama_model: LLM model identifier (format depends on provider).
-		    ollama_base_url: API base URL (for providers that need it, like Ollama).
+		    ollama_model: Ollama model name (e.g. 'qwen3:4b').
+		    ollama_base_url: Ollama API base URL.
 		"""
 		self.world_map = world_map
 		self.tick_rate = tick_rate
@@ -61,9 +126,35 @@ class SimulationEngine:
 		self.start_time = datetime.now()
 		self.events: list[SimulationEvent] = []
 		self.enable_ai = enable_ai
+		self.replan_interval: int = 10  # ticks between AI plan revisions (user-configurable)
 		self.llm_call_count: int = 0  # total LLM planning calls made
+		self.llm_response_count: int = 0  # successful LLM responses received
+		self.llm_timeout_count: int = 0  # LLM requests that timed out
+		self.llm_total_duration: float = 0.0  # cumulative seconds spent in LLM calls
 		self.llm_pending_actors: list[str] = []  # actor names currently waiting on LLM
-		
+		self.llm_request_log: deque[dict] = deque(maxlen=50)  # recent request/response pairs
+		self._plan_executor = ThreadPoolExecutor(max_workers=max(2, len(self.world_map.actors) * 2))
+		self._pending_plan_futures: dict[str, Future] = {}
+		self._pending_plan_started_tick: dict[str, int] = {}
+		self._pending_plan_started_time: dict[str, float] = {}  # wall-clock start time
+		self._plan_generation: dict[str, int] = {a.id: 0 for a in self.world_map.actors}
+		self._pending_plan_generation: dict[str, int] = {}
+		self.stale_plan_discard_count: int = 0
+		self.applied_plan_count: int = 0
+		self._plan_last_completed_tick: dict[str, int] = {}
+		self._plan_failure_cooldown_until: dict[str, int] = {}
+		self._conversation_packets: dict[str, ConversationPacket] = {}
+		self._last_reflex_event: dict[str, tuple[str, int]] = {}
+		# Separate executor for conversation packet generation so it never blocks tick().
+		self._conversation_executor = ThreadPoolExecutor(max_workers=2)
+		# Keyed by listener (target) actor id → in-flight Future.
+		self._pending_packet_futures: dict[str, Future] = {}
+		# Health check futures submitted after plan timeouts.
+		self._pending_health_checks: dict[str, Future] = {}  # actor_id → Future[tuple[bool,str]]
+		# Combat and social tracking for crime/self-defense logic.
+		self._last_attack_tick: dict[tuple[str, str], int] = {}  # (attacker_id, victim_id) -> tick
+		self._suspicion: dict[tuple[str, str], int] = {}  # (accuser_id, suspect_id) -> score
+
 		# Initialize AI brains for each actor
 		self.agent_brains: dict[str, AgentBrain] = {}
 		if enable_ai:
@@ -83,6 +174,7 @@ class SimulationEngine:
 					api_base=api_base,
 				)
 				self.agent_brains[actor.id] = brain
+				self._plan_generation.setdefault(actor.id, 0)
 				self._log_event(
 					actor_id=actor.id,
 					event_type="init",
@@ -111,6 +203,578 @@ class SimulationEngine:
 		)
 		self.events.append(event)
 
+	def _actor_by_id(self, actor_id: str) -> Actor | None:
+		"""Find an actor by id from the current world state."""
+		return next((a for a in self.world_map.actors if a.id == actor_id), None)
+
+	def _adjust_likeness(self, observer: Actor, subject_id: str, delta: int) -> None:
+		"""Adjust observer's affinity/trust toward another actor, clamped to [-100, 100]."""
+		current = observer.likeness.get(subject_id, 0)
+		observer.likeness[subject_id] = max(-100, min(100, current + delta))
+
+	def suspicion_score(self, observer_id: str, suspect_id: str) -> int:
+		"""Get observer's current suspicion score about a suspect."""
+		return self._suspicion.get((observer_id, suspect_id), 0)
+
+	def _increase_suspicion(self, observer_id: str, suspect_id: str, delta: int) -> int:
+		"""Increase suspicion score and return the updated value."""
+		key = (observer_id, suspect_id)
+		self._suspicion[key] = self._suspicion.get(key, 0) + max(0, delta)
+		return self._suspicion[key]
+
+	def _adjust_suspicion(self, observer_id: str, suspect_id: str, delta: int) -> int:
+		"""Adjust suspicion score (positive or negative), clamped at 0 lower bound."""
+		key = (observer_id, suspect_id)
+		cur = self._suspicion.get(key, 0)
+		next_val = max(0, cur + delta)
+		self._suspicion[key] = next_val
+		return next_val
+
+	def _recent_events_for_dialogue(self, actor_ids: set[str], limit: int = 8) -> list[str]:
+		"""Recent event snippets involving relevant actors, for dialogue credibility context."""
+		out: list[str] = []
+		for e in reversed(self.events):
+			if e.actor_id in actor_ids or e.data.get("target_id") in actor_ids or e.data.get("offender_id") in actor_ids:
+				out.append(f"[tick {e.tick}] {e.event_type}: {e.description}")
+			if len(out) >= limit:
+				break
+		out.reverse()
+		return out
+
+	def _mentioned_actors(self, text: str, exclude_ids: set[str] | None = None) -> list[Actor]:
+		"""Find actor mentions by id or whole-word name tokens in free-form dialogue."""
+		exclude = exclude_ids or set()
+		lower = text.lower()
+		mentioned: list[Actor] = []
+
+		for candidate in self.world_map.actors:
+			if candidate.id in exclude:
+				continue
+			if candidate.id.lower() in lower:
+				mentioned.append(candidate)
+				continue
+			name_hit = False
+			for token in candidate.name.lower().split():
+				if len(token) < 4:
+					continue
+				if re.search(rf"\b{re.escape(token)}\b", lower):
+					name_hit = True
+					break
+			if name_hit:
+				mentioned.append(candidate)
+
+		return mentioned
+
+	def _apply_dialogue_social_effects(self, speaker: Actor, listener: Actor, line: str) -> None:
+		"""Adjust likeness/suspicion using simple lexical cues from free-form dialogue.
+
+		This intentionally lightweight parser gives LLM-generated conversation immediate
+		social consequences without needing a separate structured action.
+		"""
+		text = (line or "").lower().strip()
+		if not text:
+			return
+
+		candidate_actors = [a for a in self.world_map.actors if a.id != listener.id]
+		susp_snapshot = {a.id: self.suspicion_score(listener.id, a.id) for a in candidate_actors}
+		recent_events = self._recent_events_for_dialogue({speaker.id, listener.id, *[a.id for a in candidate_actors]})
+
+		impact: dict | None = None
+		listener_brain = self.agent_brains.get(listener.id)
+		if listener_brain is not None:
+			impact = listener_brain.assess_dialogue_social_impact(
+				speaker=speaker,
+				line=line,
+				candidate_actors=candidate_actors,
+				suspicion_snapshot=susp_snapshot,
+				recent_events=recent_events,
+			)
+
+		if impact is not None:
+			likeness_delta = int(impact.get("likeness_delta", 0))
+			if likeness_delta:
+				self._adjust_likeness(listener, speaker.id, likeness_delta)
+
+			action_bias = str(impact.get("action_bias", "watch"))
+			confidence = float(impact.get("confidence", 0.0))
+			rationale = str(impact.get("rationale", ""))
+			trust_to_speaker = listener.likeness.get(speaker.id, 0)
+
+			for suspect_id, raw_delta in (impact.get("suspicion_deltas", {}) or {}).items():
+				suspect = self._actor_by_id(suspect_id)
+				if suspect is None or suspect.id == listener.id:
+					continue
+
+				# Credibility gate: accusations from neutral/low-trust speakers shouldn't be
+				# strongly believed unless trust is earned.
+				delta = int(raw_delta)
+				if delta > 0:
+					if trust_to_speaker < 20:
+						delta = 0
+					else:
+						trust_factor = min(1.0, max(0.0, (trust_to_speaker - 20) / 60.0))
+						delta = max(1, int(round(delta * trust_factor)))
+					if confidence < 0.35:
+						delta = max(0, delta - 1)
+
+				updated = self._adjust_suspicion(listener.id, suspect.id, delta)
+				if delta != 0:
+					self._log_event(
+						listener.id,
+						"dialogue_suspicion",
+						f"{listener.name} updates suspicion of {suspect.name} after hearing {speaker.name}.",
+						{
+							"speaker_id": speaker.id,
+							"suspect_id": suspect.id,
+							"delta": delta,
+							"suspicion": updated,
+							"trust_to_speaker": trust_to_speaker,
+							"confidence": confidence,
+							"action_bias": action_bias,
+							"rationale": rationale,
+						},
+					)
+
+				if listener.role == ActorRole.GUARD and action_bias in {"question", "escalate"} and updated >= 8:
+					severity = min(12, max(3, updated // 2))
+					self._guard_confront_offender(listener, suspect, severity, "reported_crime")
+			return
+
+		# Heuristic fallback path (AI unavailable): still allows social updates in
+		# no-LLM tests or degraded runtime.
+		pos_hits = sum(1 for w in POSITIVE_DIALOGUE_WORDS if w in text)
+		neg_hits = sum(1 for w in NEGATIVE_DIALOGUE_WORDS if w in text)
+		threat_hits = sum(1 for w in THREAT_DIALOGUE_WORDS if w in text)
+		accusation_hits = sum(1 for w in ACCUSATION_DIALOGUE_WORDS if w in text)
+
+		if pos_hits:
+			self._adjust_likeness(listener, speaker.id, pos_hits)
+		if neg_hits:
+			self._adjust_likeness(listener, speaker.id, -2 * neg_hits)
+		if threat_hits:
+			self._adjust_likeness(listener, speaker.id, -3 * threat_hits)
+
+		if accusation_hits > 0:
+			trust_to_speaker = listener.likeness.get(speaker.id, 0)
+			mentioned = self._mentioned_actors(text, exclude_ids={speaker.id, listener.id})
+			for suspect in mentioned:
+				if trust_to_speaker < 20:
+					delta = 0
+				else:
+					delta = max(1, (1 + accusation_hits) // 2)
+				updated = self._adjust_suspicion(listener.id, suspect.id, delta)
+				if delta != 0:
+					self._log_event(
+						listener.id,
+						"dialogue_suspicion",
+						f"{listener.name} grows suspicious of {suspect.name} after hearing {speaker.name}.",
+						{
+							"speaker_id": speaker.id,
+							"suspect_id": suspect.id,
+							"delta": delta,
+							"suspicion": updated,
+							"trust_to_speaker": trust_to_speaker,
+						},
+					)
+					if listener.role == ActorRole.GUARD and updated >= 8:
+						severity = min(12, max(3, updated // 2))
+						self._guard_confront_offender(listener, suspect, severity, "reported_crime")
+
+	def _witnesses_at(
+		self,
+		x: int,
+		y: int,
+		exclude_ids: set[str] | None = None,
+	) -> list[Actor]:
+		"""Actors who can see a location (line-of-sight + range)."""
+		exclude = exclude_ids or set()
+		witnesses: list[Actor] = []
+		for observer in self.world_map.actors:
+			if observer.id in exclude:
+				continue
+			dist = physics.distance_chebyshev(observer.x, observer.y, x, y)
+			if dist > WITNESS_VISION_RANGE:
+				continue
+			if physics.can_see(self.world_map, observer.x, observer.y, x, y):
+				witnesses.append(observer)
+		return witnesses
+
+	def _theft_severity(self, item: Item) -> int:
+		"""Translate stolen item value to crime severity (1..25)."""
+		return max(1, min(25, (item.base_price // 20) + 1))
+
+	def _assault_severity(self, damage: int) -> int:
+		"""Translate attack damage into severity for witnessed assault."""
+		return max(2, min(20, damage // 2 + 2))
+
+	def _is_self_defense(self, attacker: Actor, target: Actor) -> bool:
+		"""Return True when target recently attacked attacker within defense window."""
+		last = self._last_attack_tick.get((target.id, attacker.id))
+		if last is None:
+			return False
+		return (self.tick_count - last) <= SELF_DEFENSE_WINDOW_TICKS
+
+	def _closest_guard(self, x: int, y: int) -> Actor | None:
+		guards = [a for a in self.world_map.actors if a.role == ActorRole.GUARD and a.hp > 0]
+		if not guards:
+			return None
+		return min(guards, key=lambda g: physics.distance_chebyshev(g.x, g.y, x, y))
+
+	def _guard_confront_offender(
+		self,
+		guard: Actor,
+		offender: Actor,
+		severity: int,
+		crime_type: str,
+		victim: Actor | None = None,
+	) -> None:
+		"""Immediate guard response based on offender infamy and crime severity."""
+		if guard.id == offender.id:
+			return
+		if offender not in self.world_map.actors or guard not in self.world_map.actors:
+			return
+
+		score = offender.infamy + (severity * 2)
+		if score < 20:
+			desc = (
+				f"{guard.name} confronts {offender.name} for {crime_type} but issues only a warning."
+			)
+			self._log_event(guard.id, "guard_warning", desc, {"offender_id": offender.id, "crime": crime_type})
+			self.interrupt_actor(offender.id, f"{guard.name} warned you: {crime_type} is criminal.")
+			self._adjust_likeness(guard, offender.id, -max(1, severity // 2))
+			return
+
+		if score < 45:
+			fine = min(offender.gold, max(5, severity * 3))
+			offender.gold -= fine
+			guard.gold += fine
+			desc = f"{guard.name} fines {offender.name} {fine}g for {crime_type}."
+			self._log_event(
+				guard.id,
+				"guard_fine",
+				desc,
+				{"offender_id": offender.id, "crime": crime_type, "fine": fine},
+			)
+			offender.infamy = max(0, offender.infamy - max(1, severity // 3))
+			self._adjust_likeness(guard, offender.id, -severity)
+			return
+
+		if score < 80:
+			damage = max(5, severity * 2)
+			if offender.hp > 1:
+				damage = min(damage, offender.hp - 1)
+			offender.hp = max(0, offender.hp - damage)
+			desc = f"{guard.name} beats {offender.name} for {damage} damage as punishment for {crime_type}."
+			self._log_event(
+				guard.id,
+				"guard_assault",
+				desc,
+				{"offender_id": offender.id, "crime": crime_type, "damage": damage, "hp": offender.hp},
+			)
+			self._log_event(
+				guard.id,
+				"combat",
+				desc,
+				{"target_id": offender.id, "damage": damage, "hp": offender.hp, "source": "guard_assault"},
+			)
+			offender.infamy = max(0, offender.infamy - max(1, severity // 2))
+			self._adjust_likeness(guard, offender.id, -severity * 2)
+			return
+
+		# Very high notoriety/severity => lethal force.
+		damage, is_crit = physics.calc_damage(guard, offender)
+		offender.hp = max(0, offender.hp - damage)
+		desc = (
+			f"{guard.name} attempts lethal force on {offender.name} for {crime_type} "
+			f"({damage} damage{' CRIT' if is_crit else ''})."
+		)
+		self._log_event(
+			guard.id,
+			"guard_lethal",
+			desc,
+			{"offender_id": offender.id, "crime": crime_type, "damage": damage, "hp": offender.hp},
+		)
+		self._log_event(
+			guard.id,
+			"combat",
+			desc,
+			{"target_id": offender.id, "damage": damage, "hp": offender.hp, "source": "guard_lethal"},
+		)
+		self._adjust_likeness(guard, offender.id, -severity * 3)
+		if offender.hp == 0:
+			self._handle_actor_death(offender, killer=guard)
+
+	def _register_crime(
+		self,
+		offender: Actor,
+		crime_type: str,
+		severity: int,
+		x: int,
+		y: int,
+		victim: Actor | None = None,
+		details: dict | None = None,
+	) -> None:
+		"""Record a crime, update social state, and trigger witness/guard reactions."""
+		witnesses = self._witnesses_at(x, y, exclude_ids={offender.id})
+		witness_ids = [w.id for w in witnesses]
+
+		if witnesses:
+			offender.infamy += severity
+			offender.fame = max(0, offender.fame - max(0, severity // 3))
+
+		for w in witnesses:
+			self._adjust_likeness(w, offender.id, -severity)
+			brain = self.agent_brains.get(w.id)
+			if brain:
+				brain.memory.record(
+					tick=self.tick_count,
+					actor_id=offender.id,
+					event_type=f"witnessed_{crime_type}",
+					notes=(
+						f"I witnessed {offender.name} commit {crime_type} at ({x},{y}) "
+						f"(severity {severity})."
+					),
+				)
+			if w.role == ActorRole.GUARD:
+				self._guard_confront_offender(w, offender, severity, crime_type, victim=victim)
+
+		# Optional delayed-report flavor for shop thefts not directly witnessed.
+		if crime_type == "theft" and victim is not None and victim.id not in witness_ids:
+			self._suspicion[(victim.id, offender.id)] = self._suspicion.get((victim.id, offender.id), 0) + severity
+			guard = self._closest_guard(victim.x, victim.y)
+			if guard is not None:
+				self._log_event(
+					victim.id,
+					"report_theft",
+					f"{victim.name} suspects {offender.name} and reports theft to {guard.name}.",
+					{"suspect_id": offender.id, "severity": severity},
+				)
+				# Guard only punishes immediately if suspect still carries the stolen item.
+				stolen_item_id = (details or {}).get("item_id")
+				if stolen_item_id and any(i.id == stolen_item_id for i in offender.inventory):
+					self._guard_confront_offender(guard, offender, severity, "suspected_theft", victim=victim)
+				else:
+					self._adjust_likeness(victim, offender.id, -max(1, severity // 2))
+
+		payload = {
+			"crime_type": crime_type,
+			"severity": severity,
+			"offender_id": offender.id,
+			"victim_id": victim.id if victim else None,
+			"witnesses": witness_ids,
+		}
+		if details:
+			payload.update(details)
+
+		self._log_event(
+			offender.id,
+			"crime",
+			f"{offender.name} committed {crime_type} (severity {severity}). "
+			+ (f"Witnessed by {len(witnesses)} actor(s)." if witnesses else "No direct witnesses."),
+			payload,
+		)
+
+	def _submit_plan_request(self, actor: Actor, brain: AgentBrain) -> None:
+		"""Submit a non-blocking LLM planning request for one actor."""
+		if actor.id in self._pending_plan_futures:
+			return
+		interrupt_reason = actor.interrupt_reason
+		generation = self._plan_generation.get(actor.id, 0)
+		future = self._plan_executor.submit(brain.create_plan, interrupt_reason)
+		self._pending_plan_futures[actor.id] = future
+		self._pending_plan_started_tick[actor.id] = self.tick_count
+		self._pending_plan_started_time[actor.id] = time.monotonic()
+		self._pending_plan_generation[actor.id] = generation
+		self.llm_call_count += 1
+		self._log_event(
+			actor_id=actor.id,
+			event_type="plan_submitted",
+			description=f"{actor.name} requested a new plan",
+			data={"interrupt_reason": interrupt_reason, "generation": generation},
+		)
+
+	def _collect_completed_plan_requests(self, updates: dict) -> None:
+		"""Apply completed planning jobs without blocking the current tick."""
+		# Watchdog: abandon futures that have been pending too long.
+		for actor_id, future in list(self._pending_plan_futures.items()):
+			started = self._pending_plan_started_tick.get(actor_id, self.tick_count)
+			if not future.done() and (self.tick_count - started) >= PLAN_TIMEOUT_TICKS:
+				future.cancel()
+				duration = time.monotonic() - self._pending_plan_started_time.get(actor_id, time.monotonic())
+				self.llm_timeout_count += 1
+				self.llm_total_duration += duration
+				actor = self._actor_by_id(actor_id)
+				actor_name = actor.name if actor else actor_id
+				brain = self.agent_brains.get(actor_id)
+				request_text = brain.last_request_prompt if brain else "(plan request)"
+				if actor:
+					actor.needs_replan = True
+					actor.interrupt_reason = "previous plan request timed out — health check pending"
+					self._log_event(
+						actor_id=actor_id,
+						event_type="error",
+						description=f"{actor.name} plan request timed out after {PLAN_TIMEOUT_TICKS} ticks — running health check",
+						data={"started_tick": started, "current_tick": self.tick_count},
+					)
+				self.llm_request_log.append({
+					"tick": self.tick_count,
+					"actor": actor_name,
+					"status": "timeout",
+					"duration": round(duration, 2),
+					"request": request_text,
+					"response": f"Timed out after {PLAN_TIMEOUT_TICKS} ticks — health check submitted",
+				})
+				self._pending_plan_futures.pop(actor_id, None)
+				self._pending_plan_started_tick.pop(actor_id, None)
+				self._pending_plan_started_time.pop(actor_id, None)
+				self._pending_plan_generation.pop(actor_id, None)
+				# Submit a lightweight health check to verify LLM is still alive.
+				if brain and actor_id not in self._pending_health_checks:
+					hc_future = self._plan_executor.submit(brain.health_check)
+					self._pending_health_checks[actor_id] = hc_future
+				continue
+
+		for actor_id, future in list(self._pending_plan_futures.items()):
+			if not future.done():
+				continue
+
+			actor = self._actor_by_id(actor_id)
+			if actor is None:
+				self._pending_plan_futures.pop(actor_id, None)
+				self._pending_plan_started_tick.pop(actor_id, None)
+				self._pending_plan_started_time.pop(actor_id, None)
+				self._pending_plan_generation.pop(actor_id, None)
+				continue
+
+			submitted_generation = self._pending_plan_generation.get(actor_id, 0)
+			current_generation = self._plan_generation.get(actor_id, 0)
+			if submitted_generation != current_generation:
+				# Actor state changed while planning; discard stale result safely.
+				self.stale_plan_discard_count += 1
+				self._log_event(
+					actor_id=actor.id,
+					event_type="plan_discarded_stale",
+					description=f"Discarded stale plan for {actor.name}",
+					data={
+						"submitted_generation": submitted_generation,
+						"current_generation": current_generation,
+					},
+				)
+				self._pending_plan_futures.pop(actor_id, None)
+				self._pending_plan_started_tick.pop(actor_id, None)
+				self._pending_plan_started_time.pop(actor_id, None)
+				self._pending_plan_generation.pop(actor_id, None)
+				continue
+
+			duration = time.monotonic() - self._pending_plan_started_time.get(actor_id, time.monotonic())
+			self.llm_total_duration += duration
+
+			try:
+				plan, thought_summary = future.result()
+				self.llm_response_count += 1
+				actor.action_queue = plan
+				actor.needs_replan = False
+				actor.interrupt_reason = ""
+				self.applied_plan_count += 1
+				self._plan_last_completed_tick[actor_id] = self.tick_count
+				self._log_event(
+					actor_id=actor.id,
+					event_type="plan",
+					description=thought_summary,
+					data={"steps": len(plan), "generation": current_generation},
+				)
+				updates["actor_actions"].append({
+					"actor_id": actor.id,
+					"actor_name": actor.name,
+					"summary": thought_summary,
+				})
+				brain = self.agent_brains.get(actor_id)
+				self.llm_request_log.append({
+					"tick": self.tick_count,
+					"actor": actor.name,
+					"status": "ok",
+					"duration": round(duration, 2),
+					"request": brain.last_request_prompt if brain else "(plan request)",
+					"response": brain.last_response_raw if brain else thought_summary,
+				})
+			except Exception as e:
+				self._log_event(
+					actor_id=actor.id,
+					event_type="error",
+					description=f"{actor.name} failed to plan: {e}",
+					data={"error": str(e)},
+				)
+				actor.action_queue = []
+				actor.needs_replan = True
+				self._plan_failure_cooldown_until[actor_id] = self.tick_count + PLAN_FAILURE_COOLDOWN_TICKS
+				brain = self.agent_brains.get(actor_id)
+				self.llm_request_log.append({
+					"tick": self.tick_count,
+					"actor": actor.name,
+					"status": "error",
+					"duration": round(duration, 2),
+					"request": brain.last_request_prompt if brain else "(plan request)",
+					"response": str(e),
+				})
+
+			self._pending_plan_futures.pop(actor_id, None)
+			self._pending_plan_started_tick.pop(actor_id, None)
+			self._pending_plan_started_time.pop(actor_id, None)
+			self._pending_plan_generation.pop(actor_id, None)
+
+	def _collect_health_check_results(self) -> None:
+		"""Process completed LLM health checks submitted after plan timeouts."""
+		for actor_id, future in list(self._pending_health_checks.items()):
+			if not future.done():
+				continue
+
+			actor = self._actor_by_id(actor_id)
+			actor_name = actor.name if actor else actor_id
+
+			try:
+				alive, detail = future.result()
+			except Exception as e:
+				alive, detail = False, str(e)[:200]
+
+			if alive:
+				cooldown = TIMEOUT_REPLAN_COOLDOWN_TICKS
+				self._log_event(
+					actor_id=actor_id,
+					event_type="init",
+					description=f"LLM health check passed for {actor_name} — resuming normal planning",
+					data={"response": detail},
+				)
+				self.llm_request_log.append({
+					"tick": self.tick_count,
+					"actor": actor_name,
+					"status": "ok",
+					"duration": 0,
+					"request": "Health check: Respond with exactly: OK",
+					"response": detail,
+				})
+			else:
+				cooldown = TIMEOUT_UNHEALTHY_COOLDOWN_TICKS
+				self._log_event(
+					actor_id=actor_id,
+					event_type="error",
+					description=f"LLM health check FAILED for {actor_name} — extended cooldown ({cooldown} ticks)",
+					data={"error": detail},
+				)
+				self.llm_request_log.append({
+					"tick": self.tick_count,
+					"actor": actor_name,
+					"status": "error",
+					"duration": 0,
+					"request": "Health check: Respond with exactly: OK",
+					"response": f"FAILED: {detail}",
+				})
+
+			if actor:
+				actor.needs_replan = True
+				actor.interrupt_reason = "recovery after health check"
+			self._plan_failure_cooldown_until[actor_id] = self.tick_count + cooldown
+			self._pending_health_checks.pop(actor_id, None)
+
 	def tick(self) -> dict:
 		"""Execute one simulation tick.
 
@@ -125,61 +789,56 @@ class SimulationEngine:
 		}
 
 		if self.enable_ai:
-			# Split actors into those needing a new plan vs those executing existing steps
-			needs_plan: list = []  # (actor, brain)
-			has_steps: list = []   # actor
+			# Apply any plan jobs that completed since previous tick(s), without blocking.
+			self._collect_completed_plan_requests(updates)
+			# Process LLM health checks (submitted after timeouts).
+			self._collect_health_check_results()
 
-			for actor in self.world_map.actors:
-				brain = self.agent_brains.get(actor.id)
-				if not brain:
+			# Submit new plan requests in priority order, respecting replan interval.
+			# ALL plan submissions (including interrupts) wait for the next replan interval
+			# boundary (tick_count % replan_interval == 0). interrupt_reason still controls
+			# sort priority so urgent cases are processed first when the tick arrives.
+			is_replan_tick = (self.tick_count % self.replan_interval == 0)
+			candidates = [
+				a for a in self.world_map.actors
+				if (a.needs_replan or not a.action_queue)
+				and a.id not in self._pending_plan_futures
+				and a.id not in self._pending_health_checks
+				and self.agent_brains.get(a.id)
+				and self._plan_failure_cooldown_until.get(a.id, 0) <= self.tick_count
+			]
+			candidates.sort(key=lambda a: (
+				0 if (a.needs_replan and a.interrupt_reason) else
+				1 if a.needs_replan else
+				2
+			))
+			for actor in candidates:
+				if len(self._pending_plan_futures) >= MAX_CONCURRENT_PLAN_JOBS:
+					break
+				# No plan submissions outside the replan interval tick — user controls pacing.
+				if not is_replan_tick:
 					continue
-				if actor.needs_replan or not actor.action_queue:
-					needs_plan.append((actor, brain))
-				else:
-					has_steps.append(actor)
+				self._submit_plan_request(actor, self.agent_brains[actor.id])
 
-			# —— Fire all planning calls in parallel ——
-			if needs_plan:
-				self.llm_call_count += len(needs_plan)
-				self.llm_pending_actors = [a.name for a, _ in needs_plan]
+			# Keep UI status in sync with currently pending planning jobs.
+			self.llm_pending_actors = [
+				a.name
+				for a in self.world_map.actors
+				if a.id in self._pending_plan_futures
+			]
 
-				def _plan_actor(actor_brain_pair):
-					actor, brain = actor_brain_pair
-					return actor, brain.create_plan(interrupt_reason=actor.interrupt_reason)
-
-				with ThreadPoolExecutor(max_workers=len(needs_plan)) as pool:
-					futures = {pool.submit(_plan_actor, pair): pair[0] for pair in needs_plan}
-					for future in as_completed(futures):
-						actor = futures[future]
-						try:
-							actor, (plan, thought_summary) = future.result()
-							actor.action_queue = plan
-							actor.needs_replan = False
-							actor.interrupt_reason = ""
-							self._log_event(
-								actor_id=actor.id,
-								event_type="plan",
-								description=thought_summary,
-								data={"steps": len(plan)},
-							)
-							updates["actor_actions"].append({
-								"actor_id": actor.id,
-								"actor_name": actor.name,
-								"summary": thought_summary,
-							})
-						except Exception as e:
-							self._log_event(
-								actor_id=actor.id,
-								event_type="error",
-								description=f"{actor.name} failed to plan: {e}",
-								data={"error": str(e)},
-							)
-							actor.action_queue = []
-
-				self.llm_pending_actors = []
-
-			# —— Execute one step for actors with existing plans (sequential, mutates state) ——
-			for actor in has_steps:
+			# Execute one step for actors with existing plans (sequential, mutates state).
+			for actor in self.world_map.actors:
+				if not actor.action_queue:
+					# Run a local reflex action while the actor waits on a pending LLM plan.
+					if actor.id in self._pending_plan_futures:
+						result = self._reflex_action(actor)
+						updates["actor_actions"].append({
+							"actor_id": actor.id,
+							"actor_name": actor.name,
+							"summary": result,
+						})
+					continue
 				action = actor.action_queue.pop(0)
 				result = self._execute_action(actor, action)
 				updates["actor_actions"].append({
@@ -202,6 +861,11 @@ class SimulationEngine:
 		self.tick_count += 1
 		return updates
 
+	def _effective_inventory(self, actor: Actor) -> list[Item]:
+		"""Carried items plus any shelf items owned by this actor."""
+		shelf = [gi.item for gi in self.world_map.world_items if gi.owner_id == actor.id]
+		return list(actor.inventory) + shelf
+
 	def interrupt_actor(self, actor_id: str, reason: str) -> None:
 		"""Mark an actor as needing to replan immediately.
 
@@ -210,6 +874,12 @@ class SimulationEngine:
 		"""
 		actor = next((a for a in self.world_map.actors if a.id == actor_id), None)
 		if actor:
+			self._plan_generation[actor_id] = self._plan_generation.get(actor_id, 0) + 1
+			pending = self._pending_plan_futures.pop(actor_id, None)
+			if pending is not None and not pending.done():
+				pending.cancel()
+			self._pending_plan_started_tick.pop(actor_id, None)
+			self._pending_plan_generation.pop(actor_id, None)
 			actor.needs_replan = True
 			actor.interrupt_reason = reason
 			actor.action_queue = []
@@ -220,6 +890,53 @@ class SimulationEngine:
 				data={"reason": reason},
 			)
 
+	def _reflex_action(self, actor: Actor) -> str:
+		"""Execute a local fallback action when an actor has no queued plan but is waiting on LLM.
+
+		Keeps actors visibly active every tick without requiring LLM input.
+		Priority: trade-range adjacency > conversation-range awareness > idle observe.
+		"""
+		from src.agents.prompts import CONVERSATION_RANGE
+
+		def _log_reflex_once(description: str, data: dict) -> str:
+			"""Suppress identical reflex logs for a few ticks to avoid event spam."""
+			last = self._last_reflex_event.get(actor.id)
+			if last is not None:
+				last_desc, last_tick = last
+				if last_desc == description and (self.tick_count - last_tick) < 5:
+					return description
+			self._log_event(actor.id, "reflex_action", description, data)
+			self._last_reflex_event[actor.id] = (description, self.tick_count)
+			return description
+
+		# Prefer trade-range adjacency (≤2 tiles) — actor is in position and holding
+		for other in self.world_map.actors:
+			if other.id == actor.id:
+				continue
+			dist = physics.distance_chebyshev(actor.x, actor.y, other.x, other.y)
+			if dist <= 2:
+				desc = f"{actor.name} stands ready near {other.name}, waiting for a plan"
+				return _log_reflex_once(
+					desc,
+					{"nearby_actor": other.id, "dist": dist, "context": "trade_range"},
+				)
+
+		# Acknowledge nearby actors within conversation range (≤8 tiles)
+		for other in self.world_map.actors:
+			if other.id == actor.id:
+				continue
+			dist = physics.distance_chebyshev(actor.x, actor.y, other.x, other.y)
+			if dist <= CONVERSATION_RANGE:
+				desc = f"{actor.name} watches {other.name} nearby while gathering thoughts"
+				return _log_reflex_once(
+					desc,
+					{"nearby_actor": other.id, "dist": dist, "context": "conversation_range"},
+				)
+
+		# Default: hold position and observe surroundings
+		desc = f"{actor.name} pauses and observes their surroundings"
+		return _log_reflex_once(desc, {"context": "idle"})
+
 	def _execute_action(self, actor: Actor, action: PlannedAction) -> str:
 		"""Execute one planned action step. Returns a description of what happened.
 
@@ -227,7 +944,13 @@ class SimulationEngine:
 		is called so the LLM replans on the next tick.
 		"""
 		if action.action_type == "move":
-			direction = action.params.get("direction", "").lower().strip()
+			try:
+				p = MoveParams.model_validate(action.params)
+			except Exception as e:
+				reason = f"Invalid move params: {e}"
+				self.interrupt_actor(actor.id, reason)
+				return reason
+			direction = p.direction.lower().strip()
 			if direction not in physics.DIRECTIONS_8:
 				reason = f"Invalid direction in plan: '{direction}'"
 				self.interrupt_actor(actor.id, reason)
@@ -265,11 +988,133 @@ class SimulationEngine:
 		elif action.action_type == "propose_trade":
 			return self._execute_trade_action(actor, action.params)
 
+		elif action.action_type == "pick_up":
+			return self._execute_pickup_action(actor, action)
+
+		elif action.action_type == "place":
+			return self._execute_place_action(actor, action)
+
 		elif action.action_type == "converse":
-			return self._execute_converse_action(actor, action.params)
+			return self._execute_converse_action(actor, action)
+
+		elif action.action_type == "attack":
+			return self._execute_attack_action(actor, action)
+
+		elif action.action_type == "equip":
+			return self._execute_equip_action(actor, action)
+
+		elif action.action_type == "unequip":
+			return self._execute_unequip_action(actor, action)
+
+		elif action.action_type == "use_item":
+			return self._execute_use_item_action(actor, action)
 
 		else:
 			return f"Unknown action type: '{action.action_type}'"
+
+	def _execute_pickup_action(self, actor: Actor, action: PlannedAction) -> str:
+		"""Pick up an unowned item from the current or an adjacent tile."""
+		try:
+			p = PickUpParams.model_validate(action.params)
+		except Exception as e:
+			reason = f"Invalid pick_up params: {e}"
+			self.interrupt_actor(actor.id, reason)
+			return reason
+
+		# Search for the item within adjacency range (Chebyshev ≤ 1)
+		target_gi: WorldItem | None = None
+		for gi in self.world_map.world_items:
+			if gi.item.id == p.item_id:
+				if physics.distance_chebyshev(actor.x, actor.y, gi.x, gi.y) <= 1:
+					target_gi = gi
+					break
+
+		if target_gi is None:
+			reason = f"No item '{p.item_id}' within reach to pick up"
+			self.interrupt_actor(actor.id, reason)
+			return reason
+
+		owner = None
+		is_theft = target_gi.owner_id is not None and target_gi.owner_id != actor.id
+		if is_theft:
+			owner = self._actor_by_id(target_gi.owner_id)
+
+		# Carry-capacity check
+		if self._carry_count(actor) >= actor.max_carry:
+			reason = (
+				f"{actor.name} is carrying too many items ({actor.max_carry}/{actor.max_carry}) "
+				"— drop or place something first"
+			)
+			self.interrupt_actor(actor.id, reason)
+			return reason
+
+		# Transfer: remove from ground, add to inventory
+		self.world_map.world_items = [
+			gi for gi in self.world_map.world_items if gi is not target_gi
+		]
+		actor.inventory.append(target_gi.item)
+
+		if is_theft:
+			severity = self._theft_severity(target_gi.item)
+			self._register_crime(
+				offender=actor,
+				crime_type="theft",
+				severity=severity,
+				x=target_gi.x,
+				y=target_gi.y,
+				victim=owner,
+				details={"item_id": target_gi.item.id, "item_value": target_gi.item.base_price},
+			)
+			owner_name = owner.name if owner else str(target_gi.owner_id)
+			desc = (
+				f"WARNING: {actor.name} steals {target_gi.item.name} from {owner_name}! "
+				f"(value {target_gi.item.base_price}g)"
+			)
+			self._log_event(
+				actor.id,
+				"steal",
+				desc,
+				{"item_id": target_gi.item.id, "owner_id": target_gi.owner_id, "x": target_gi.x, "y": target_gi.y},
+			)
+		else:
+			desc = f"{actor.name} picked up {target_gi.item.name} x{target_gi.item.quantity}"
+			self._log_event(actor.id, "pick_up", desc, {"item_id": target_gi.item.id, "x": target_gi.x, "y": target_gi.y})
+		return desc
+
+	def _execute_place_action(self, actor: Actor, action: PlannedAction) -> str:
+		"""Place an item from inventory onto a nearby tile."""
+		try:
+			p = PlaceParams.model_validate(action.params)
+		except Exception as e:
+			reason = f"Invalid place params: {e}"
+			self.interrupt_actor(actor.id, reason)
+			return reason
+
+		if physics.distance_chebyshev(actor.x, actor.y, p.x, p.y) > 1:
+			reason = f"Tile ({p.x},{p.y}) is too far away to place on"
+			self.interrupt_actor(actor.id, reason)
+			return reason
+
+		if not self.world_map.in_bounds(p.x, p.y):
+			reason = f"Tile ({p.x},{p.y}) is out of map bounds"
+			self.interrupt_actor(actor.id, reason)
+			return reason
+
+		item = next((i for i in actor.inventory if i.id == p.item_id), None)
+		if item is None:
+			reason = f"{actor.name} does not have item '{p.item_id}' in inventory"
+			self.interrupt_actor(actor.id, reason)
+			return reason
+
+		actor.inventory = [i for i in actor.inventory if i.id != p.item_id]
+		tile = self.world_map.tile_at(p.x, p.y)
+		# Items placed on a shop tile are owned by the placing actor (their shelf)
+		owner_id = actor.id if tile.tile_type.value == "shop" else None
+		self.world_map.world_items.append(WorldItem(item=item, x=p.x, y=p.y, owner_id=owner_id))
+		loc = "shelf" if tile.tile_type.value == "shop" else "ground"
+		desc = f"{actor.name} placed {item.name} on the {loc} at ({p.x},{p.y})"
+		self._log_event(actor.id, "place", desc, {"item_id": item.id, "x": p.x, "y": p.y, "location": loc})
+		return desc
 
 	def _resolve_actor(self, target_id: str) -> Actor | None:
 		"""Find an actor by id, falling back to case-insensitive name match."""
@@ -279,13 +1124,22 @@ class SimulationEngine:
 		lower = target_id.lower()
 		return next((a for a in self.world_map.actors if a.name.lower() == lower), None)
 
-	def _execute_converse_action(self, actor: Actor, params: dict) -> str:
-		"""Execute a converse action: initiator speaks, listener replies, both record memory."""
+	def _execute_converse_action(self, actor: Actor, action: PlannedAction) -> str:
+		"""Execute a converse action: initiator speaks, listener replies, both record memory.
+
+		Conversation packet generation is non-blocking: the LLM call is submitted to a
+		dedicated executor and the action is re-queued until the reply is ready.
+		"""
 		from src.agents.prompts import CONVERSATION_RANGE
-		target_id = params.get("target_actor_id", "")
-		target = self._resolve_actor(target_id)
+		try:
+			p = ConverseParams.model_validate(action.params)
+		except Exception as e:
+			reason = f"Invalid converse params: {e}"
+			self.interrupt_actor(actor.id, reason)
+			return reason
+		target = self._resolve_actor(p.target_actor_id)
 		if target is None:
-			return f"{actor.name} tries to speak but finds no one called '{target_id}'."
+			return f"{actor.name} tries to speak but finds no one called '{p.target_actor_id}'."
 
 		dist = physics.distance_chebyshev(actor.x, actor.y, target.x, target.y)
 		if dist > CONVERSATION_RANGE:
@@ -293,12 +1147,56 @@ class SimulationEngine:
 			self.interrupt_actor(actor.id, reason)
 			return reason
 
-		opening_line = params.get("opening_line", "Hello.").strip() or "Hello."
+		opening_line = p.opening_line.strip() or "Hello."
 
-		# Listener's brain generates a reply and a private impression
 		listener_brain = self.agent_brains.get(target.id)
 		if listener_brain:
-			reply, listener_impression = listener_brain.conduct_conversation(actor, opening_line)
+			# ── Non-blocking packet resolution ───────────────────────────────
+			packet_future = self._pending_packet_futures.get(target.id)
+
+			if packet_future is not None:
+				if not packet_future.done():
+					# LLM still generating — retry this action next tick
+					actor.action_queue.insert(0, action)
+					return f"{actor.name} waits for {target.name} to formulate a reply..."
+				# Future finished — collect result
+				try:
+					c_reply, c_follow_ups, c_tone, c_impression = packet_future.result()
+				except Exception:
+					c_reply, c_follow_ups, c_tone, c_impression = "*nods but says nothing*", [], "", "No impression formed."
+				self._pending_packet_futures.pop(target.id, None)
+				reply = c_reply
+				listener_impression = c_impression
+				if c_follow_ups:
+					self._conversation_packets[target.id] = ConversationPacket(
+						initiator_id=actor.id,
+						lines=c_follow_ups,
+						created_tick=self.tick_count,
+						tone=c_tone,
+					)
+			else:
+				# Check cached packet first
+				packet = self._conversation_packets.get(target.id)
+				packet_valid = (
+					packet is not None
+					and packet.initiator_id == actor.id
+					and (self.tick_count - packet.created_tick) < packet.packet_ttl_ticks
+					and bool(packet.lines)
+				)
+				if packet_valid:
+					reply = packet.lines.pop(0)
+					listener_impression = f"(continuing, tone: {packet.tone})" if packet.tone else "(continuing)"
+					if not packet.lines:
+						del self._conversation_packets[target.id]
+				else:
+					# No cache and no pending future — submit non-blocking LLM call
+					self._pending_packet_futures[target.id] = self._conversation_executor.submit(
+						listener_brain.conduct_conversation_packet, actor, opening_line
+					)
+					self.llm_call_count += 1
+					actor.action_queue.insert(0, action)
+					return f"{actor.name} says to {target.name}: '{opening_line}' (waiting for reply...)"
+
 		else:
 			reply = "*nods but says nothing*"
 			listener_impression = "No impression formed."
@@ -307,13 +1205,17 @@ class SimulationEngine:
 		self._log_event(
 			actor.id, "converse",
 			f'{actor.name} says to {target.name}: "{opening_line}"',
-			{"target_id": target_id, "line": opening_line},
+			{"target_id": p.target_actor_id, "line": opening_line},
 		)
 		self._log_event(
 			target.id, "converse",
 			f'{target.name} replies to {actor.name}: "{reply}"',
 			{"target_id": actor.id, "line": reply},
 		)
+
+		# Free-form dialogue can shape trust/suspicion.
+		self._apply_dialogue_social_effects(speaker=actor, listener=target, line=opening_line)
+		self._apply_dialogue_social_effects(speaker=target, listener=actor, line=reply)
 
 		# Both actors record the exchange in their relationship memory
 		initiator_brain = self.agent_brains.get(actor.id)
@@ -331,23 +1233,280 @@ class SimulationEngine:
 				event_type="converse",
 				notes=f"{actor.name} said: \"{opening_line}\" — I replied: \"{reply}\". My impression: {listener_impression}",
 			)
-			# Soft interrupt: listener replans next tick knowing they were just addressed
-			# Only interrupt if they don't already have a converse or trade step queued
-			next_action = target.action_queue[0].action_type if target.action_queue else None
-			if next_action not in ("converse", "propose_trade"):
-				self.interrupt_actor(
-					target.id,
-					f"{actor.name} just spoke to you: \"{opening_line}\" — you replied: \"{reply}\". You may respond further or continue what you were doing.",
-				)
+			# The listener has already recorded the conversation in memory; they will
+			# naturally incorporate it when their current plan exhausts and cadence allows.
+			# No interrupt needed — conversations are non-critical events.
 
 		return f'{actor.name} → {target.name}: "{opening_line}" | {target.name}: "{reply}"'
 
+	def _execute_attack_action(self, actor: Actor, action: PlannedAction) -> str:
+		"""Execute a melee attack against a target actor."""
+		try:
+			p = AttackParams.model_validate(action.params)
+		except Exception as e:
+			reason = f"Invalid attack params: {e}"
+			self.interrupt_actor(actor.id, reason)
+			return reason
+
+		target = self._resolve_actor(p.target_actor_id)
+		if target is None:
+			reason = f"Attack target '{p.target_actor_id}' not found"
+			self.interrupt_actor(actor.id, reason)
+			return reason
+
+		dist = physics.distance_chebyshev(actor.x, actor.y, target.x, target.y)
+		if dist > physics.MELEE_RANGE:
+			reason = f"{target.name} is {dist} tiles away — move closer to attack"
+			self.interrupt_actor(actor.id, reason)
+			return reason
+
+		damage, is_crit = physics.calc_damage(actor, target)
+		target.hp = max(0, target.hp - damage)
+		self._last_attack_tick[(actor.id, target.id)] = self.tick_count
+
+		# Unprovoked witnessed assault is a crime; retaliation in recent self-defense window is exempt.
+		if not self._is_self_defense(actor, target):
+			severity = self._assault_severity(damage)
+			self._register_crime(
+				offender=actor,
+				crime_type="assault",
+				severity=severity,
+				x=actor.x,
+				y=actor.y,
+				victim=target,
+				details={"target_id": target.id, "damage": damage},
+			)
+
+		crit_str = " (CRITICAL HIT!)" if is_crit else ""
+		desc = (
+			f"{actor.name} attacks {target.name} for {damage} damage{crit_str}! "
+			f"{target.name} HP: {target.hp}/{target.max_hp}"
+		)
+		self._log_event(actor.id, "attack", desc, {
+			"target_id": target.id,
+			"damage": damage,
+			"is_crit": is_crit,
+			"target_hp": target.hp,
+		})
+		self._log_event(actor.id, "combat", desc, {
+			"target_id": target.id,
+			"damage": damage,
+			"is_crit": is_crit,
+			"target_hp": target.hp,
+			"source": "attack",
+		})
+
+		if target.hp == 0:
+			self._handle_actor_death(target, killer=actor)
+
+		return desc
+
+	def _handle_actor_death(self, actor: Actor, killer: Actor | None = None) -> None:
+		"""Remove a dead actor: drop their inventory + equipped items and a corpse WorldItem.
+
+		- All personal inventory items land as unowned floor WorldItems at the actor's position.
+		- Equipped items are also dropped.
+		- A 'corpse' WorldItem (unique id, non-tradeable relic) is placed at the same tile.
+		- The actor is removed from world_map.actors.
+		- Other actors whose plans reference this actor will get an interrupt naturally
+		  the next time they try to target them.
+		"""
+		killer_name = killer.name if killer else "unknown causes"
+		death_desc = f"{actor.name} has been slain by {killer_name}!"
+		self._log_event(
+			actor.id, "death", death_desc,
+			{"killer_id": killer.id if killer else None, "x": actor.x, "y": actor.y},
+		)
+
+		# Drop all personal inventory items
+		for item in actor.inventory:
+			self.world_map.world_items.append(
+				WorldItem(item=item, x=actor.x, y=actor.y, owner_id=None)
+			)
+		actor.inventory.clear()
+
+		# Drop all equipped items
+		for slot, item in actor.equipped.items():
+			if item is not None:
+				self.world_map.world_items.append(
+					WorldItem(item=item, x=actor.x, y=actor.y, owner_id=None)
+				)
+				actor.equipped[slot] = None
+
+		# Drop a corpse marker
+		corpse_item = Item(
+			id=f"corpse_{actor.id}",
+			name=f"Corpse of {actor.name}",
+			description=(
+				f"The lifeless body of {actor.name}, slain by {killer_name}. "
+				"Grim testament to the dangers of this market."
+			),
+			base_price=0,
+			quantity=1,
+			metadata={"category": "corpse", "type": "body", "origin_id": actor.id},
+		)
+		self.world_map.world_items.append(
+			WorldItem(item=corpse_item, x=actor.x, y=actor.y, owner_id=None)
+		)
+
+		# Remove from simulation
+		self.world_map.actors = [a for a in self.world_map.actors if a.id != actor.id]
+		self.agent_brains.pop(actor.id, None)
+
+	def _carry_count(self, actor: Actor) -> int:
+		"""Number of item stacks the actor is carrying in personal inventory.
+
+		Shelf items (WorldItems with owner_id == actor.id) are NOT counted.
+		"""
+		return len(actor.inventory)
+
+	def _execute_equip_action(self, actor: Actor, action: PlannedAction) -> str:
+		"""Move an item from inventory into its equipment slot."""
+		try:
+			p = EquipParams.model_validate(action.params)
+		except Exception as e:
+			reason = f"Invalid equip params: {e}"
+			self.interrupt_actor(actor.id, reason)
+			return reason
+
+		# Find item in inventory
+		item = next((i for i in actor.inventory if i.id == p.item_id), None)
+		if item is None:
+			reason = f"{actor.name} does not have '{p.item_id}' in inventory"
+			self.interrupt_actor(actor.id, reason)
+			return reason
+
+		raw_slot = item.metadata.get("slot", "")
+		if not raw_slot:
+			reason = f"'{item.name}' has no equipment slot defined"
+			self.interrupt_actor(actor.id, reason)
+			return reason
+
+		# two_hand weapons occupy the 'hand' slot and clear 'offhand'
+		if raw_slot == "two_hand":
+			equip_slot = "hand"
+			# Return any existing offhand to inventory
+			old_offhand = actor.equipped.get("offhand")
+			if old_offhand is not None:
+				actor.inventory.append(old_offhand)
+				actor.equipped["offhand"] = None
+		else:
+			equip_slot = raw_slot
+
+		if equip_slot not in actor.equipped:
+			reason = f"Equipment slot '{equip_slot}' is not valid"
+			self.interrupt_actor(actor.id, reason)
+			return reason
+
+		# Block equipping an offhand while a two-hand weapon is in hand
+		if equip_slot == "offhand":
+			hand_item = actor.equipped.get("hand")
+			if hand_item is not None and hand_item.metadata.get("slot") == "two_hand":
+				reason = f"Cannot equip offhand while wielding two-handed {hand_item.name}"
+				self.interrupt_actor(actor.id, reason)
+				return reason
+
+		# Return any currently equipped item in that slot to inventory
+		old_item = actor.equipped.get(equip_slot)
+		if old_item is not None:
+			actor.inventory.append(old_item)
+
+		actor.inventory.remove(item)
+		actor.equipped[equip_slot] = item
+
+		desc = f"{actor.name} equipped {item.name} to {equip_slot} slot"
+		self._log_event(actor.id, "equip", desc, {"item_id": item.id, "slot": equip_slot})
+		return desc
+
+	def _execute_unequip_action(self, actor: Actor, action: PlannedAction) -> str:
+		"""Move an equipped item back to inventory."""
+		try:
+			p = UnequipParams.model_validate(action.params)
+		except Exception as e:
+			reason = f"Invalid unequip params: {e}"
+			self.interrupt_actor(actor.id, reason)
+			return reason
+
+		slot = p.slot
+		if slot not in actor.equipped:
+			reason = f"'{slot}' is not a valid equipment slot"
+			self.interrupt_actor(actor.id, reason)
+			return reason
+
+		item = actor.equipped.get(slot)
+		if item is None:
+			desc = f"{actor.name} has nothing in the {slot} slot"
+			return desc
+
+		actor.equipped[slot] = None
+		actor.inventory.append(item)
+
+		desc = f"{actor.name} unequipped {item.name} from {slot} slot"
+		self._log_event(actor.id, "unequip", desc, {"item_id": item.id, "slot": slot})
+		return desc
+
+	def _execute_use_item_action(self, actor: Actor, action: PlannedAction) -> str:
+		"""Consume a consumable item from inventory, applying its effects."""
+		try:
+			p = UseItemParams.model_validate(action.params)
+		except Exception as e:
+			reason = f"Invalid use_item params: {e}"
+			self.interrupt_actor(actor.id, reason)
+			return reason
+
+		item = next((i for i in actor.inventory if i.id == p.item_id), None)
+		if item is None:
+			reason = f"{actor.name} does not have '{p.item_id}' in inventory"
+			self.interrupt_actor(actor.id, reason)
+			return reason
+
+		category = item.metadata.get("category", "")
+		if category != "consumable":
+			reason = f"'{item.name}' is not a consumable item"
+			self.interrupt_actor(actor.id, reason)
+			return reason
+
+		effects = []
+
+		if item.hp_delta != 0:
+			old_hp = actor.hp
+			actor.hp = max(0, min(actor.max_hp, actor.hp + item.hp_delta))
+			actual = actor.hp - old_hp
+			if actual >= 0:
+				effects.append(f"+{actual} HP ({actor.hp}/{actor.max_hp})")
+			else:
+				effects.append(f"{actual} HP ({actor.hp}/{actor.max_hp})")
+
+		if item.attack_delta != 0:
+			actor.base_attack = max(0, actor.base_attack + item.attack_delta)
+			effects.append(f"attack {'+'if item.attack_delta>0 else ''}{item.attack_delta} → {actor.base_attack}")
+
+		if item.defense_delta != 0:
+			actor.base_defense = max(0, actor.base_defense + item.defense_delta)
+			effects.append(f"defense {'+'if item.defense_delta>0 else ''}{item.defense_delta} → {actor.base_defense}")
+
+		if item.crit_delta != 0.0:
+			actor.base_crit = max(0.0, min(1.0, actor.base_crit + item.crit_delta))
+			effects.append(f"crit {'+'if item.crit_delta>0 else ''}{item.crit_delta:.2f} → {actor.base_crit:.2f}")
+
+		actor.inventory.remove(item)
+
+		effects_str = ", ".join(effects) if effects else "no effect"
+		desc = f"{actor.name} used {item.name}: {effects_str}"
+		self._log_event(actor.id, "use_item", desc, {"item_id": item.id, "effects": effects})
+		return desc
+
 	def _execute_trade_action(self, actor: Actor, params: dict) -> str:
 		"""Execute a propose_trade action step."""
-		target_id = params.get("target_actor_id", "")
-		target = self._resolve_actor(target_id)
+		try:
+			p = ProposeTradeParams.model_validate(params)
+		except Exception as e:
+			reason = f"Invalid propose_trade params: {e}"
+			self.interrupt_actor(actor.id, reason)
+			return reason
+		target = self._resolve_actor(p.target_actor_id)
 		if target is None:
-			reason = f"Trade target '{target_id}' not found"
+			reason = f"Trade target '{p.target_actor_id}' not found"
 			self.interrupt_actor(actor.id, reason)
 			return reason
 
@@ -357,13 +1516,12 @@ class SimulationEngine:
 			self.interrupt_actor(actor.id, reason)
 			return reason
 
-		offered_gold = int(params.get("offered_gold", 0))
-		requested_gold = int(params.get("requested_gold", 0))
-
 		def _resolve_items(id_str: str, owner: Actor) -> tuple[list, str | None]:
 			if not id_str or not id_str.strip():
 				return [], None
-			inv = {i.id: i for i in owner.inventory}
+			# Effective inventory = carried items + owned shelf items
+			eff_inv = self._effective_inventory(owner)
+			inv = {i.id: i for i in eff_inv}
 			matched = []
 			for iid in [s.strip() for s in id_str.split(",") if s.strip()]:
 				if iid not in inv:
@@ -371,11 +1529,11 @@ class SimulationEngine:
 				matched.append(inv[iid])
 			return matched, None
 
-		offered_items, err = _resolve_items(params.get("offered_item_ids", ""), actor)
+		offered_items, err = _resolve_items(p.offered_item_ids, actor)
 		if err:
 			self.interrupt_actor(actor.id, err)
 			return err
-		requested_items, err = _resolve_items(params.get("requested_item_ids", ""), target)
+		requested_items, err = _resolve_items(p.requested_item_ids, target)
 		if err:
 			self.interrupt_actor(actor.id, err)
 			return err
@@ -384,9 +1542,9 @@ class SimulationEngine:
 			proposer_id=actor.id,
 			target_id=target.id,
 			offered_items=offered_items,
-			offered_gold=offered_gold,
+			offered_gold=p.offered_gold,
 			requested_items=requested_items,
-			requested_gold=requested_gold,
+			requested_gold=p.requested_gold,
 		)
 		return self.evaluate_trade_proposal(proposal=proposal, proposer=actor, target=target)
 
@@ -415,6 +1573,8 @@ class SimulationEngine:
 					"x": actor.x,
 					"y": actor.y,
 					"gold": actor.gold,
+					"fame": actor.fame,
+					"infamy": actor.infamy,
 					"hp": actor.hp,
 				}
 				for actor in self.world_map.actors
@@ -442,6 +1602,15 @@ class SimulationEngine:
 			}
 			for e in self.events[-limit:]
 		]
+
+	def get_actor_conversation_logs(self) -> dict[str, list[dict]]:
+		"""Return per-actor LLM conversation logs keyed by actor name."""
+		logs: dict[str, list[dict]] = {}
+		for actor_id, brain in self.agent_brains.items():
+			actor = self._actor_by_id(actor_id)
+			name = actor.name if actor else actor_id
+			logs[name] = list(brain.conversation_log)
+		return logs
 
 	def evaluate_trade_proposal(
 		self,
@@ -529,6 +1698,7 @@ class SimulationEngine:
 
 		Returns None on success, or an error string if the trade is no longer
 		valid (e.g. gold or items changed between evaluation and execution).
+		Handles shelf items (owned WorldItems) on the target's side.
 		"""
 		# Re-validate gold
 		if proposal.offered_gold > proposer.gold:
@@ -536,14 +1706,34 @@ class SimulationEngine:
 		if proposal.requested_gold > target.gold:
 			return f"{target.name} no longer has enough gold."
 
-		# Re-validate items still in inventory
-		proposer_inv = {item.id: item for item in proposer.inventory}
-		target_inv = {item.id: item for item in target.inventory}
+		# Re-validate items (proposer must carry offered items)
+		proposer_carried = {item.id: item for item in proposer.inventory}
 		for item in proposal.offered_items:
-			if item.id not in proposer_inv:
+			if item.id not in proposer_carried:
 				return f"{proposer.name} no longer has {item.name}."
+
+		# Carry-capacity checks before committing the transfer
+		items_proposer_gains = len(proposal.requested_items)
+		items_target_gains = len(proposal.offered_items)
+		proposer_free = proposer.max_carry - self._carry_count(proposer)
+		target_free = target.max_carry - self._carry_count(target)
+		# Adjust for items leaving each inventory
+		proposer_net = items_proposer_gains - len(proposal.offered_items)
+		target_net = items_target_gains - len(proposal.requested_items)
+		if proposer_net > proposer_free:
+			return f"{proposer.name} doesn't have enough carry space for this trade."
+		if target_net > target_free:
+			return f"{target.name} doesn't have enough carry space for this trade."
+
+		# Requested items may be in target's carried inventory OR on their shelf
+		target_carried = {item.id: item for item in target.inventory}
+		target_shelf: dict[str, WorldItem] = {
+			gi.item.id: gi
+			for gi in self.world_map.world_items
+			if gi.owner_id == target.id
+		}
 		for item in proposal.requested_items:
-			if item.id not in target_inv:
+			if item.id not in target_carried and item.id not in target_shelf:
 				return f"{target.name} no longer has {item.name}."
 
 		# Transfer gold
@@ -552,14 +1742,20 @@ class SimulationEngine:
 		target.gold += proposal.offered_gold
 		target.gold -= proposal.requested_gold
 
-		# Transfer items: offered items go from proposer → target
+		# Transfer offered items: proposer carried → target inventory
 		for item in proposal.offered_items:
 			proposer.inventory = [i for i in proposer.inventory if i.id != item.id]
 			target.inventory.append(item)
 
-		# Requested items go from target → proposer
+		# Transfer requested items: target (carried or shelf) → proposer inventory
 		for item in proposal.requested_items:
-			target.inventory = [i for i in target.inventory if i.id != item.id]
+			if item.id in target_shelf:
+				# Remove from the world items list
+				self.world_map.world_items = [
+					gi for gi in self.world_map.world_items if gi.item.id != item.id
+				]
+			else:
+				target.inventory = [i for i in target.inventory if i.id != item.id]
 			proposer.inventory.append(item)
 
 		return None
